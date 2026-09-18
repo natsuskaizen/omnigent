@@ -261,7 +261,11 @@ async def test_attach_direct_tmux_runs_tmux_without_nested_env(
         captured["argv"], captured["env"] = argv, env
         return _Process()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        w.module,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"create_subprocess_exec": fake_exec})),
+    )
 
     await w.module._attach_direct_tmux(Path("/tmp/sock"), "sess:0")
 
@@ -499,7 +503,11 @@ async def test_wait_for_terminal_polls_until_it_appears(
         return None
 
     monkeypatch.setattr(w.module, f"_find_running_{w.key}_terminal", fake_find)
-    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        w.module,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"sleep": no_sleep})),
+    )
 
     terminal = await w.fn("_wait_for_{k}_terminal_ready")(object(), "conv_1", timeout_s=30.0)
 
