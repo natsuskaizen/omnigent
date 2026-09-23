@@ -149,16 +149,29 @@ def _wildcard_entry_suffix(entry: str) -> tuple[str, str, int | None] | None:
     :returns: ``(scheme, dotted_suffix, port)`` — ``dotted_suffix`` keeps
         its leading ``.`` (e.g. ``".ts.net"``) so a suffix match can never
         cross a label boundary — when ``entry``'s host is exactly a
-        ``*.`` leftmost label followed by a non-empty domain. ``None``
-        when ``entry`` is not a wildcard entry at all, or is one with an
-        ambiguous or empty pattern (a bare ``*``, ``*.``, a second ``*``
-        anywhere, or the wildcard outside the leftmost label) — those
+        ``*.`` leftmost label followed by a non-empty domain, and the
+        entry carries nothing beyond ``scheme://*.<domain>[:port]`` (no
+        path, query, fragment, or userinfo — those have no meaning for an
+        ``Origin``, which is exactly ``scheme://host[:port]``, so any
+        entry carrying one is a malformed pattern, not a decorated valid
+        one). ``None`` when ``entry`` is not a wildcard entry at all, or
+        is one with an ambiguous, decorated, or empty pattern (a bare
+        ``*``, ``*.``, a second ``*`` anywhere, a path/query/fragment/
+        userinfo, or the wildcard outside the leftmost label) — those
         never match anything rather than risk over-matching.
     """
     try:
         parts = urlsplit(entry)
         port = parts.port  # raises ValueError lazily for an out-of-range port
     except ValueError:
+        return None
+    if (
+        parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+        or parts.username
+        or parts.password
+    ):
         return None
     host = parts.hostname
     if not parts.scheme or host is None or not host.startswith("*."):
@@ -214,7 +227,12 @@ def origin_allowed(
       origin literally in ``extra_allowed``, and any origin matching a
       ``*.``-prefixed wildcard entry in ``extra_allowed`` (e.g.
       ``https://*.ts.net`` trusting every ``*.ts.net`` subdomain — see
-      :func:`_origin_matches_wildcard_entry`) are always allowed.
+      :func:`_origin_matches_wildcard_entry`) are always allowed. An
+      origin containing ``*`` is never admitted via literal equality —
+      ``*`` isn't a valid hostname character, so no real browser can ever
+      send one; it is resolved purely as a wildcard pattern (valid →
+      suffix match, invalid → matches nothing), never as an exact-string
+      replay of a configured entry.
     - A missing ``Origin`` is allowed: non-browser clients never send one,
       and browsers always do (the header is on the forbidden-header list,
       so page JS cannot strip or forge it), so its absence is not a
@@ -237,7 +255,7 @@ def origin_allowed(
     if origin == OMNIGENT_INTERNAL_WS_ORIGIN:
         return True
     if origin is not None and (
-        origin in extra_allowed
+        ("*" not in origin and origin in extra_allowed)
         or any(_origin_matches_wildcard_entry(origin, entry) for entry in extra_allowed)
     ):
         return True

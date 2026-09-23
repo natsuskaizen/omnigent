@@ -211,6 +211,10 @@ def test_origin_allowed_with_wildcard_allowlist(origin: str, allowed: bool) -> N
         "https://a.*.ts.net",  # wildcard not in the leftmost label
         "https://**.ts.net",  # not a clean "*." leftmost label
         "https://*.ts.*",  # a second "*" elsewhere in the pattern
+        "https://*.ts.net/*",  # decorated with a path
+        "https://*.ts.net?x=*",  # decorated with a query string
+        "https://*@*.ts.net",  # decorated with userinfo
+        "https://*:*@*.ts.net",  # decorated with userinfo (username and password)
     ],
 )
 def test_malformed_wildcard_entry_matches_nothing(entry: str) -> None:
@@ -222,11 +226,23 @@ def test_malformed_wildcard_entry_matches_nothing(entry: str) -> None:
     everything". A failure here would turn a typo'd allowlist entry into
     an accidental open origin policy.
 
+    The decorated-with-path/query/userinfo cases matter because an
+    ``Origin`` is never anything but ``scheme://host[:port]`` — a
+    wildcard entry carrying any of those is not a decorated valid
+    pattern, it's a malformed one, even though the literal string a
+    non-browser client could replay as its own ``Origin`` header would
+    ordinarily still contain the same characters.
+
     :param entry: The malformed allowlist entry under test.
     :returns: None.
     """
     extra = frozenset({entry})
-    for candidate in ("https://foo.ts.net", "https://ts.net", "https://evil.example.com"):
+    for candidate in (
+        "https://foo.ts.net",
+        "https://ts.net",
+        "https://evil.example.com",
+        entry,  # literal replay of the entry's own text must not match either
+    ):
         assert origin_allowed(candidate, local_mode=False, extra_allowed=extra) is False
 
 
@@ -315,6 +331,58 @@ def test_wildcard_and_literal_entries_coexist() -> None:
     )
 
 
+def test_wildcard_entry_is_never_admitted_by_literal_replay() -> None:
+    """A configured wildcard entry's own text is not itself a trusted Origin.
+
+    ``*`` isn't a valid hostname character, so no real browser can ever
+    send an ``Origin`` equal to a wildcard entry's literal text — only a
+    non-browser client crafting a raw header could. Such an origin must
+    be resolved purely through the wildcard-matching rule (here, it
+    trivially satisfies the suffix check on its own malformed hostname),
+    never admitted merely because it happens to equal a configured
+    string verbatim. A failure here would mean an entry's own raw text
+    doubles as an unintended second, redundant admission path.
+
+    :returns: None.
+    """
+    entry = "https://*.ts.net"
+    extra = frozenset({entry})
+    # Still allowed: the origin's hostname ("*.ts.net") satisfies the
+    # wildcard suffix rule on its own — but via the wildcard path, not a
+    # literal-equality shortcut.
+    assert origin_allowed(entry, local_mode=False, extra_allowed=extra) is True
+
+
+def test_tailnet_scoped_wildcard_excludes_other_tailnets_and_apex() -> None:
+    """A tailnet-scoped wildcard entry admits only that tailnet's machines.
+
+    ``*.ts.net`` is Tailscale's single shared public suffix across every
+    customer's tailnet, so it is not itself a safe recommendation for
+    "trust my tailnet" — the deployment docs must scope the wildcard to
+    the operator's own tailnet name (``*.<tailnet>.ts.net``). This proves
+    the mechanism actually enforces that narrower boundary: a machine on
+    the configured tailnet is admitted, a machine on a different tailnet
+    (also ending in ``.ts.net``) is not, and neither is the tailnet's own
+    apex.
+
+    :returns: None.
+    """
+    extra = frozenset({"https://*.my-tailnet.ts.net"})
+    assert (
+        origin_allowed("https://machine.my-tailnet.ts.net", local_mode=False, extra_allowed=extra)
+        is True
+    )
+    assert (
+        origin_allowed(
+            "https://machine.other-tailnet.ts.net", local_mode=False, extra_allowed=extra
+        )
+        is False
+    )
+    assert (
+        origin_allowed("https://my-tailnet.ts.net", local_mode=False, extra_allowed=extra) is False
+    )
+
+
 def test_wildcard_allowlist_admits_subdomain_in_local_mode() -> None:
     """A wildcarded allowlist entry also applies in local mode.
 
@@ -382,6 +450,9 @@ def test_parse_allowed_origins_unset_is_empty(monkeypatch: pytest.MonkeyPatch) -
         "https://a.*.ts.net",
         "https://**.ts.net",
         "https://*.ts.*",
+        "https://*.ts.net/*",
+        "https://*.ts.net?x=*",
+        "https://*@*.ts.net",
     ],
 )
 def test_parse_allowed_origins_warns_once_on_malformed_wildcard(
