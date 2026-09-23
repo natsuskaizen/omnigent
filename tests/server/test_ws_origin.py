@@ -14,6 +14,7 @@ Three layers, each catching a distinct breakage:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from omnigent.process_logging import _log_once_seen
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.ws_origin import (
     FORBIDDEN_ORIGIN_CLOSE_CODE,
@@ -160,6 +162,176 @@ def test_origin_allowed_with_allowlist(
     assert origin_allowed(origin, local_mode=local_mode, extra_allowed=extra) is allowed
 
 
+@pytest.mark.parametrize(
+    "origin,allowed",
+    [
+        # Happy path: subdomain (any depth) over the wildcarded scheme.
+        ("https://foo.ts.net", True),
+        ("https://machine.tailnet.ts.net", True),  # real Tailscale MagicDNS shape
+        ("https://a.b.c.ts.net", True),  # arbitrarily deep is still a subdomain
+        # The bare domain itself is not a subdomain of itself.
+        ("https://ts.net", False),
+        # Scheme must still match exactly.
+        ("http://foo.ts.net", False),
+        # A domain that merely ends with the same letters, but not on a
+        # label boundary, must not match (naive suffix-matching bug).
+        ("https://evilts.net", False),
+        ("https://foots.net", False),
+        # A different domain that happens to end similarly.
+        ("https://foo.evilts.net", False),
+        ("https://foo.notts.net", False),
+        # Case-insensitivity, like real hostnames.
+        ("https://FOO.TS.NET", True),
+        # Missing/unparseable origin never matches a wildcard entry either.
+        ("not-a-url", False),
+    ],
+)
+def test_origin_allowed_with_wildcard_allowlist(origin: str, allowed: bool) -> None:
+    """A ``*.``-prefixed allowlist entry trusts every subdomain, any depth.
+
+    A failure here means either a legitimate subdomain (including nested,
+    which is how Tailscale MagicDNS names actually look) was rejected, or
+    — more dangerously — a lookalike/attacker domain (``evilts.net``,
+    ``foo.evilts.net``) was wrongly admitted because the suffix match
+    crossed a label boundary instead of stopping at a ``.``.
+
+    :param origin: The handshake ``Origin`` under test.
+    :param allowed: Expected policy decision.
+    :returns: None.
+    """
+    extra = frozenset({"https://*.ts.net"})
+    assert origin_allowed(origin, local_mode=False, extra_allowed=extra) is allowed
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://*",  # bare wildcard, no domain at all
+        "https://*.",  # nothing after the wildcard label
+        "https://a.*.ts.net",  # wildcard not in the leftmost label
+        "https://**.ts.net",  # not a clean "*." leftmost label
+        "https://*.ts.*",  # a second "*" elsewhere in the pattern
+    ],
+)
+def test_malformed_wildcard_entry_matches_nothing(entry: str) -> None:
+    """A malformed wildcard-looking entry fails closed, not open.
+
+    Each of these is ambiguous enough that guessing its intent would risk
+    over-matching, so the policy must treat it as matching no real
+    ``Origin`` at all rather than, say, silently falling back to "match
+    everything". A failure here would turn a typo'd allowlist entry into
+    an accidental open origin policy.
+
+    :param entry: The malformed allowlist entry under test.
+    :returns: None.
+    """
+    extra = frozenset({entry})
+    for candidate in ("https://foo.ts.net", "https://ts.net", "https://evil.example.com"):
+        assert origin_allowed(candidate, local_mode=False, extra_allowed=extra) is False
+
+
+def test_wildcard_entry_honors_explicit_port() -> None:
+    """A wildcard entry with an explicit port only admits that same port.
+
+    Mirrors the exact-match behavior for literal entries: an allowlisted
+    origin string with a port only matches an ``Origin`` carrying that
+    same port. A failure here would mean the wildcard silently ignores
+    port scoping that an operator explicitly configured.
+
+    :returns: None.
+    """
+    extra = frozenset({"https://*.ts.net:8443"})
+    assert origin_allowed("https://foo.ts.net:8443", local_mode=False, extra_allowed=extra) is True
+    assert origin_allowed("https://foo.ts.net", local_mode=False, extra_allowed=extra) is False
+    assert (
+        origin_allowed("https://foo.ts.net:9000", local_mode=False, extra_allowed=extra) is False
+    )
+
+
+def test_wildcard_entry_without_port_requires_no_explicit_port() -> None:
+    """A portless wildcard entry does not admit an origin with a port.
+
+    Consistent with literal-entry semantics, where the allowlisted string
+    must match the ``Origin`` exactly (including the absence of a port):
+    an entry that never mentions a port only matches origins that also
+    omit one.
+
+    :returns: None.
+    """
+    extra = frozenset({"https://*.ts.net"})
+    assert (
+        origin_allowed("https://foo.ts.net:8443", local_mode=False, extra_allowed=extra) is False
+    )
+
+
+def test_out_of_range_port_in_wildcard_entry_fails_closed_not_crash() -> None:
+    """A malformed port in a configured wildcard entry never raises.
+
+    ``urlsplit(...).port`` raises ``ValueError`` lazily, on access, for a
+    port outside 0-65535. A misconfigured allowlist entry (an operator
+    typo) must not crash every WebSocket handshake and file upload on the
+    server — it should simply never match, like any other malformed
+    entry.
+
+    :returns: None.
+    """
+    extra = frozenset({"https://*.ts.net:99999"})
+    assert origin_allowed("https://foo.ts.net", local_mode=False, extra_allowed=extra) is False
+
+
+def test_out_of_range_port_in_origin_header_fails_closed_not_crash() -> None:
+    """A malformed port in the incoming ``Origin`` header never raises.
+
+    Unlike the allowlist entry (operator-controlled), the ``Origin``
+    header comes from whatever client opens the connection — not
+    necessarily a real browser, since only a real browser is bound by the
+    forbidden-header list. Once a deployment configures even one wildcard
+    entry, any client could otherwise crash every origin check on demand
+    by sending an out-of-range port, a denial-of-service vector. It must
+    instead just fail to match.
+
+    :returns: None.
+    """
+    extra = frozenset({"https://*.ts.net"})
+    assert (
+        origin_allowed("https://evil.com:999999", local_mode=False, extra_allowed=extra) is False
+    )
+
+
+def test_wildcard_and_literal_entries_coexist() -> None:
+    """A wildcard entry and a literal entry in the same allowlist both apply.
+
+    A failure here would mean adding a wildcard entry accidentally
+    disables, or is disabled by, an existing literal entry in the same
+    ``OMNIGENT_WS_ALLOWED_ORIGINS`` value.
+
+    :returns: None.
+    """
+    extra = frozenset({"https://*.ts.net", "https://ui.example.com"})
+    assert origin_allowed("https://foo.ts.net", local_mode=False, extra_allowed=extra) is True
+    assert origin_allowed("https://ui.example.com", local_mode=False, extra_allowed=extra) is True
+    assert (
+        origin_allowed("https://other.example.com", local_mode=False, extra_allowed=extra) is False
+    )
+
+
+def test_wildcard_allowlist_admits_subdomain_in_local_mode() -> None:
+    """A wildcarded allowlist entry also applies in local mode.
+
+    Local mode's loopback-only default still applies to origins the
+    allowlist doesn't cover, but an explicitly wildcarded origin should be
+    admitted the same way a literal allowlist entry already is (see
+    ``test_origin_allowed_with_allowlist``).
+
+    :returns: None.
+    """
+    extra = frozenset({"https://*.ts.net"})
+    assert origin_allowed("https://foo.ts.net", local_mode=True, extra_allowed=extra) is True
+    assert (
+        origin_allowed("https://evil.example.com", local_mode=True, extra_allowed=extra) is False
+    )
+
+
 def test_parse_allowed_origins_splits_and_strips(monkeypatch: pytest.MonkeyPatch) -> None:
     """The allowlist env is split on commas with whitespace stripped.
 
@@ -173,6 +345,23 @@ def test_parse_allowed_origins_splits_and_strips(monkeypatch: pytest.MonkeyPatch
     assert parse_allowed_origins() == frozenset({"https://a.example.com", "https://b.example.com"})
 
 
+def test_parse_allowed_origins_passes_through_wildcard_entry_unparsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``*.``-prefixed entry round-trips through parsing untouched.
+
+    ``parse_allowed_origins`` only splits and strips; wildcard expansion
+    is entirely :func:`origin_allowed`'s job. A failure here would mean
+    the raw entry was mangled (e.g. the ``*`` stripped) before it ever
+    reaches the matching logic.
+
+    :param monkeypatch: pytest env patcher.
+    :returns: None.
+    """
+    monkeypatch.setenv(_ALLOWLIST_ENV, "https://*.ts.net, https://ui.example.com")
+    assert parse_allowed_origins() == frozenset({"https://*.ts.net", "https://ui.example.com"})
+
+
 def test_parse_allowed_origins_unset_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unset allowlist env yields an empty set (passthrough default).
 
@@ -183,6 +372,74 @@ def test_parse_allowed_origins_unset_is_empty(monkeypatch: pytest.MonkeyPatch) -
     """
     monkeypatch.delenv(_ALLOWLIST_ENV, raising=False)
     assert parse_allowed_origins() == frozenset()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://*",
+        "https://*.",
+        "https://a.*.ts.net",
+        "https://**.ts.net",
+        "https://*.ts.*",
+    ],
+)
+def test_parse_allowed_origins_warns_once_on_malformed_wildcard(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, entry: str
+) -> None:
+    """A malformed wildcard-looking entry logs one warning per process.
+
+    Without this, a typo'd allowlist entry just silently matches nothing
+    forever — the only symptom is a legitimate origin mysteriously getting
+    rejected, with no diagnostic pointing at the bad entry. Since this
+    function runs on every connection (not just at startup), a repeat call
+    with the same misconfiguration must not re-log — that's what
+    ``log_once`` is for.
+
+    :param monkeypatch: pytest env patcher.
+    :param caplog: pytest log capture fixture.
+    :param entry: A malformed wildcard-looking allowlist entry.
+    :returns: None.
+    """
+    logger_name = "omnigent.server.ws_origin"
+    _log_once_seen.clear()
+    monkeypatch.setenv(_ALLOWLIST_ENV, entry)
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        parse_allowed_origins()
+        parse_allowed_origins()  # same misconfiguration again -> not re-logged
+    records = [r for r in caplog.records if r.name == logger_name]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert entry in records[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://*.ts.net",  # valid wildcard
+        "https://ui.example.com",  # ordinary literal, no "*" at all
+    ],
+)
+def test_parse_allowed_origins_does_not_warn_on_well_formed_entry(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, entry: str
+) -> None:
+    """Neither a valid wildcard nor an ordinary literal entry logs a warning.
+
+    A failure here (a warning fires anyway) would mean every deployment's
+    perfectly valid configuration gets spammed with a false-positive
+    diagnostic.
+
+    :param monkeypatch: pytest env patcher.
+    :param caplog: pytest log capture fixture.
+    :param entry: A well-formed allowlist entry that must not warn.
+    :returns: None.
+    """
+    logger_name = "omnigent.server.ws_origin"
+    _log_once_seen.clear()
+    monkeypatch.setenv(_ALLOWLIST_ENV, entry)
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        parse_allowed_origins()
+    assert [r for r in caplog.records if r.name == logger_name] == []
 
 
 # --------------------------------------------------------------------------
@@ -493,4 +750,38 @@ def test_e2e_allowlist_denies_unlisted_origin_in_non_local_mode(
         ws.send_text("hi")
         assert ws.receive_text() == "echo:hi"
     # Only the allowlisted connection reached the route.
+    assert app.state.accepted == [True]
+
+
+def test_e2e_wildcard_allowlist_admits_subdomain_and_denies_lookalike(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``*.``-prefixed allowlist entry works end-to-end through the ASGI stack.
+
+    Exercises the full path from a real WebSocket handshake down through
+    :func:`parse_allowed_origins` and :func:`origin_allowed`: a subdomain
+    of the wildcarded domain connects, while a lookalike domain that
+    merely ends with the same letters (not on a label boundary) is
+    refused — proving the label-boundary safety isn't just a unit-level
+    accident of ``origin_allowed`` but actually wired into the middleware.
+
+    :param monkeypatch: pytest env patcher.
+    :returns: None.
+    """
+    monkeypatch.delenv(_LOCAL_ENV, raising=False)
+    monkeypatch.setenv(_ALLOWLIST_ENV, "https://*.ts.net")
+    app = _make_app()
+    client = TestClient(app)
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/ws", headers={"origin": "https://evilts.net"}):
+            pass
+    assert exc_info.value.code == FORBIDDEN_ORIGIN_CLOSE_CODE
+    assert app.state.accepted == []
+
+    with client.websocket_connect(
+        "/ws", headers={"origin": "https://machine.tailnet.ts.net"}
+    ) as ws:
+        ws.send_text("hi")
+        assert ws.receive_text() == "echo:hi"
     assert app.state.accepted == [True]

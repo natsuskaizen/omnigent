@@ -50,6 +50,18 @@ Origin header"* on chat and file uploads. Without `OMNIGENT_ACCOUNTS_BASE_URL`
 session cookies won't use the `__Host-` prefix and invite links resolve to
 the wrong host.
 
+If several devices on your tailnet will each connect with their own
+`<machine>.ts.net` hostname, trust the whole tailnet in one entry instead
+of listing every machine (see [`../README.md`](../README.md#browser-origin-allowlist)
+for the general `*.` wildcard syntax):
+
+```dotenv
+OMNIGENT_WS_ALLOWED_ORIGINS=https://*.ts.net
+```
+
+`OMNIGENT_ACCOUNTS_BASE_URL` still needs one concrete host, since it is
+used to build actual URLs rather than to check one.
+
 **With Docker Compose** (`deploy/docker/`), add both lines to your `.env`:
 
 ```bash
@@ -117,6 +129,6 @@ sandbox:
 
 | Variable | Purpose |
 |---|---|
-| `OMNIGENT_WS_ALLOWED_ORIGINS` | Comma-separated origin allowlist. Set to `https://<machine>.ts.net` to trust the Tailscale origin for WebSocket and multipart routes. |
+| `OMNIGENT_WS_ALLOWED_ORIGINS` | Comma-separated origin allowlist. Set to `https://<machine>.ts.net` to trust the Tailscale origin for WebSocket and multipart routes, or `https://*.ts.net` to trust every device on the tailnet in one entry (see [`../README.md`](../README.md#browser-origin-allowlist)). |
 | `OMNIGENT_ACCOUNTS_BASE_URL` | Public base URL. Used for session cookie security (`__Host-` prefix) and invite / magic-link URLs. |
 | `OMNIGENT_AUTH_ENABLED` | `1` to require login. Recommended when using Tailscale Funnel (public internet exposure). |
