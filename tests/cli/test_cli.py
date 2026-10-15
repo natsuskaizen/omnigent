@@ -5127,6 +5127,10 @@ def test_run_server_agent_flag_forwards_agent_name(monkeypatch: pytest.MonkeyPat
             ],
             "--from-openclaw",
         ),
+        (
+            ["run", "--server", "http://localhost:8000", "--agent", "scribe", "--continue"],
+            "--continue",
+        ),
     ],
 )
 def test_run_agent_flag_rejected_outside_direct_server_new_session(
@@ -5146,6 +5150,13 @@ def test_run_agent_flag_rejected_outside_direct_server_new_session(
     assert "--agent" in result.output and expected in result.output
     run_chat.assert_not_called()
     run_attach.assert_not_called()
+
+
+def test_run_help_lists_the_agent_option() -> None:
+    result = CliRunner().invoke(cli, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--agent NAME" in result.output
 
 
 def test_run_agent_flag_needs_explicit_server_not_config_default(

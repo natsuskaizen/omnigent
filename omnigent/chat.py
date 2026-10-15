@@ -1086,6 +1086,13 @@ def _chat_with_server(
         agent_name = _attach_session_info(
             base_url=base_url, conversation_id=existing_session_id
         ).agent_name
+        if agent_name is None:
+            from omnigent.util.server_url import display_server_url
+
+            raise cli_error_without_recovery_hint(
+                f"Couldn't read session {printable(existing_session_id)} on "
+                f"{display_server_url(base_url)}. Check the id and that the server is reachable."
+            )
     # A one-shot ``-p`` has no one to answer a picker menu.
     selected_agent = agent_name or _pick_agent(base_url, quiet=initial_message is not None)
 
@@ -1487,7 +1494,14 @@ def _list_server_agent_names(base_url: str) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
     for scope in (None, "user"):
-        for item in _agent_listing_pages(base_url, scope=scope):
+        try:
+            rows = _agent_listing_pages(base_url, scope=scope)
+        except httpx.HTTPStatusError:
+            if scope is None:
+                raise
+            # The caller's own agents are optional; server agents still work.
+            rows = []
+        for item in rows:
             name = item.get("name") if isinstance(item, dict) else None
             if isinstance(name, str) and name and name not in seen:
                 names.append(name)
@@ -1555,16 +1569,23 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
             names.append(name)
             seen.add(name)
 
+    from omnigent.util.server_url import display_server_url
+
+    shown_url = display_server_url(base_url)
     # Only server agents can start a new session by name; sessions may also
     # carry session-scoped (uploaded) agents. A fresh server has no sessions.
-    server_names = _list_server_agent_names(base_url)
+    try:
+        server_names = _list_server_agent_names(base_url)
+    except httpx.HTTPStatusError as exc:
+        if not names:
+            raise cli_error_without_recovery_hint(
+                f"Couldn't list the agents on {shown_url} (HTTP {exc.response.status_code})."
+            ) from exc
+        server_names = []
     if server_names:
         names = [name for name in names if name in server_names] or server_names
         seen = set(names)
 
-    from omnigent.util.server_url import display_server_url
-
-    shown_url = display_server_url(base_url)
     if not names:
         raise cli_error_without_recovery_hint(
             f"The server at {shown_url} has no agents. Install one with "
@@ -2527,8 +2548,6 @@ async def _query_sessions_once(
         emitted.
     :raises RuntimeError: If no runner id was supplied.
     """
-    from omnigent_client import SessionsChat
-
     from omnigent.remote_launch import (
         LaunchHostError,
         resolve_remote_launch_host,
@@ -2546,6 +2565,10 @@ async def _query_sessions_once(
             # resolvable by name, so take the harness from the session.
             resumed = await client.sessions.get(resume_conversation_id)
             harness = resumed.harness
+            if harness is None and resumed.agent_name:
+                # An older snapshot without a harness: ask the session's agent.
+                with contextlib.suppress(LookupError):
+                    harness = (await client.sessions.resolve_agent(resumed.agent_name)).harness
         else:
             agent = await _resolve_remote_agent(client, agent_name)
             harness = agent.harness
@@ -2605,6 +2628,48 @@ async def _query_sessions_once(
         bound = await client.sessions.bind_runner(created.id, runner_id=runner_id)
     if on_session_ready is not None:
         on_session_ready(bound.id)
+    del agent_name
+    try:
+        return await _run_bound_turn(
+            client=client, bound=bound, prompt=prompt, tool_callables=tool_callables
+        )
+    finally:
+        if launch_host_id is not None:
+            await _stop_launched_session(client, bound.id)
+
+
+async def _stop_launched_session(client: OmnigentClient, session_id: str) -> None:
+    """
+    Stop the runner a one-shot had a host launch, best-effort.
+
+    :param client: Connected SDK client.
+    :param session_id: The finished session's id, e.g. ``"conv_abc123"``.
+    """
+    # Teardown must never turn a completed run into a failed one.
+    try:
+        await client.sessions.post_event(session_id, {"type": "stop_session", "data": {}})
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
+
+
+async def _run_bound_turn(
+    *,
+    client: OmnigentClient,
+    bound: SessionSnapshot,
+    prompt: str,
+    tool_callables: dict[str, ToolCallable] | None,
+) -> str | None:
+    """
+    Send one prompt on a bound session and return the final assistant text.
+
+    :param client: Connected SDK client.
+    :param bound: The created or resumed session, bound to a runner.
+    :param prompt: User prompt for the turn.
+    :param tool_callables: Client-side tool callables, or ``None``.
+    :returns: Final assistant text, or ``None`` when no text was emitted.
+    """
+    from omnigent_client import SessionsChat
+
     session_files = client.files.for_session(bound.id)
     chat = SessionsChat(
         namespace=client.sessions,
@@ -2614,7 +2679,6 @@ async def _query_sessions_once(
         tool_callables=tool_callables,
         agent_tools_getter=client._fetch_agent_tools,
     )
-    del agent_name
     # A transport-level runner disconnect publishes ``session.status:
     # failed`` for every session pinned to that runner (server
     # ``_on_runner_disconnect``), even when the turn already completed

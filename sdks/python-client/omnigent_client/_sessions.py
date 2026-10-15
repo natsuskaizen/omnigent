@@ -574,7 +574,7 @@ class SessionsNamespace:
                             id=str(item["id"]),
                             harness=str(harness) if isinstance(harness, str) else None,
                         )
-                    if isinstance(name, str):
+                    if isinstance(name, str) and name not in names:
                         if len(names) < 50:
                             names.append(name)
                         else:

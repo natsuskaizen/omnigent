@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from omnigent.cli_diagnostics import printable
@@ -9,6 +10,8 @@ from omnigent.cli_invocation import cli_invocation
 
 if TYPE_CHECKING:
     from omnigent_client import SessionsNamespace
+
+logger = logging.getLogger(__name__)
 
 
 class LaunchHostError(RuntimeError):
@@ -69,13 +72,20 @@ async def resolve_remote_launch_host(
         that can't run *harness*.
     :raises RemoteLaunchHostError: If only other machines' hosts could.
     """
+    from omnigent_client import OmnigentError
+
     from omnigent.harness_aliases import canonicalize_harness
     from omnigent.host import identity
 
-    hosts = await sessions.list_launch_hosts(
-        harness=harness,
-        canonicalize=lambda name: canonicalize_harness(name) or name,
-    )
+    try:
+        hosts = await sessions.list_launch_hosts(
+            harness=harness,
+            canonicalize=lambda name: canonicalize_harness(name) or name,
+        )
+    except OmnigentError:
+        # Can't see the hosts: report the missing runner as before.
+        logger.debug("could not list launch hosts", exc_info=True)
+        return None
     local = identity.load_host_identity_if_present()
     mine = next((h for h in hosts if local is not None and h.host_id == local.host_id), None)
     if mine is not None:

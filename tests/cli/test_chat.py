@@ -5301,3 +5301,222 @@ def test_query_sessions_once_unknown_agent_is_a_clean_cli_error() -> None:
         _query_once(client, agent_name="ghost")
 
     assert suppresses_recovery_hint(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Resume hint, one-shot cleanup, discovery errors and resume lookups
+# ---------------------------------------------------------------------------
+
+
+def test_build_resume_parts_strips_agent() -> None:
+    """``--agent`` only starts a new session, so the exit resume command drops it."""
+    ctx = _make_run_context(server="http://127.0.0.1:6799", agent_name="scribe")
+    with ctx:
+        parts = _build_resume_parts()
+
+    assert "--agent" not in parts and "scribe" not in parts
+    assert parts[-2:] == ["--server", "http://127.0.0.1:6799"]
+
+
+class _HostLaunchSessions:
+    """Sessions stub for a full host-launched one-shot turn."""
+
+    def __init__(self, *, online_runner: str | None, stop_error: Exception | None = None) -> None:
+        self._online_runner = online_runner
+        self._stop_error = stop_error
+        self.events: list[tuple[str, dict[str, object]]] = []
+        self.created: dict[str, object] = {}
+
+    async def resolve_agent(self, _name: str) -> SimpleNamespace:
+        return SimpleNamespace(id="id_scribe", harness="claude-sdk")
+
+    async def resolve_online_runner(self, **_kwargs: object) -> str | None:
+        return self._online_runner
+
+    async def list_launch_hosts(self, **_kwargs: object) -> list[object]:
+        from omnigent_client import LaunchHost
+
+        return [LaunchHost("host_local", "me.local")]
+
+    async def create_from_agent_id(self, agent_id: str, **kwargs: object) -> SimpleNamespace:
+        self.created = dict(kwargs, agent_id=agent_id)
+        return SimpleNamespace(id="conv_launched")
+
+    async def bind_runner(self, session_id: str, *, runner_id: str) -> SimpleNamespace:
+        return SimpleNamespace(id=session_id)
+
+    async def post_event(self, session_id: str, event: dict[str, object]) -> dict[str, object]:
+        self.events.append((session_id, event))
+        if self._stop_error is not None:
+            raise self._stop_error
+        return {"queued": False}
+
+
+def _host_launch_turn(
+    sessions: _HostLaunchSessions, monkeypatch: pytest.MonkeyPatch
+) -> str | None:
+    async def _reply(_prompt: str) -> QueryResult:
+        return QueryResult(text="pong")
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", _fake_sessions_chat_cls(_reply))
+    _local_host(monkeypatch, "host_local")
+    client = SimpleNamespace(
+        sessions=sessions,
+        files=SimpleNamespace(for_session=lambda _sid: SimpleNamespace(upload=None, get=None)),
+        _fetch_agent_tools=lambda *_a, **_kw: [],
+    )
+    return asyncio.run(
+        chat_module._query_sessions_once(
+            client=client,  # type: ignore[arg-type]
+            agent_name="scribe",
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+        )
+    )
+
+
+def test_query_sessions_once_stops_a_host_launched_one_shot_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``-p`` run that made the host start a runner stops it when the turn ends."""
+    sessions = _HostLaunchSessions(online_runner=None)
+
+    assert _host_launch_turn(sessions, monkeypatch) == "pong"
+
+    assert sessions.created["host_id"] == "host_local"
+    assert sessions.events == [("conv_launched", {"type": "stop_session", "data": {}})]
+
+
+def test_query_sessions_once_stop_failure_keeps_the_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup is best-effort: a failed stop never turns a finished run into an error."""
+    sessions = _HostLaunchSessions(online_runner=None, stop_error=ClientOmnigentError("gone"))
+
+    assert _host_launch_turn(sessions, monkeypatch) == "pong"
+
+
+def test_query_sessions_once_leaves_an_adopted_runner_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner the server already had isn't this run's to stop."""
+    sessions = _HostLaunchSessions(online_runner="runner_shared")
+
+    assert _host_launch_turn(sessions, monkeypatch) == "pong"
+
+    assert sessions.events == []
+
+
+def test_pick_agent_keeps_session_agents_when_agent_listing_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing ``/v1/agents`` doesn't break discovery that sessions can answer."""
+
+    def _get(url: str, **_kwargs: object) -> _ListingResp:
+        if url.endswith("/v1/sessions"):
+            return _ListingResp({"data": [{"agent_name": "scribe"}]})
+        return _ListingResp({}, status_code=500)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    assert _pick_agent("http://127.0.0.1:6799", quiet=True) == "scribe"
+
+
+def test_pick_agent_agent_listing_error_without_sessions_is_a_clean_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    def _get(url: str, **_kwargs: object) -> _ListingResp:
+        if url.endswith("/v1/sessions"):
+            return _ListingResp({"data": []})
+        return _ListingResp({}, status_code=500)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    with pytest.raises(click.ClickException, match="500") as excinfo:
+        _pick_agent("http://127.0.0.1:6799", quiet=True)
+
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+def test_list_server_agent_names_ignores_a_failing_user_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _get(_url: str, **kwargs: object) -> _ListingResp:
+        params = kwargs.get("params")
+        if isinstance(params, dict) and params.get("scope") == "user":
+            return _ListingResp({}, status_code=500)
+        return _ListingResp({"data": [{"name": "scribe"}], "has_more": False})
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    assert chat_module._list_server_agent_names("http://127.0.0.1:6799") == ["scribe"]
+
+
+def test_query_sessions_once_resume_without_harness_resolves_the_sessions_agent() -> None:
+    """An older snapshot without a harness still finds a runner for the right agent."""
+    seen: dict[str, object] = {}
+
+    async def _resolve_agent(name: str) -> SimpleNamespace:
+        seen["resolved"] = name
+        return SimpleNamespace(id="id_scribe", harness="claude-sdk")
+
+    async def _get(session_id: str) -> SimpleNamespace:
+        return SimpleNamespace(id=session_id, harness=None, agent_name="scribe")
+
+    async def _online_runner(**kwargs: object) -> str:
+        seen["harness"] = kwargs.get("harness")
+        return "runner_1"
+
+    async def _bind_runner(session_id: str, *, runner_id: str) -> None:
+        raise _StopAfterBind
+
+    client = SimpleNamespace(
+        sessions=SimpleNamespace(
+            resolve_agent=_resolve_agent,
+            get=_get,
+            resolve_online_runner=_online_runner,
+            bind_runner=_bind_runner,
+        )
+    )
+
+    with pytest.raises(_StopAfterBind):
+        _query_once(client, agent_name="ignored", resume_conversation_id="conv_x")
+
+    assert seen == {"resolved": "scribe", "harness": "claude-sdk"}
+
+
+@pytest.mark.parametrize("session_kwarg", ["resume_conversation_id", "fork_session_id"])
+def test_chat_with_server_unreadable_session_never_falls_back_to_the_picker(
+    session_kwarg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resume can't take ``--agent``, so a failed lookup must not suggest it."""
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
+    monkeypatch.setattr(
+        chat_module,
+        "_attach_session_info",
+        lambda **_kw: chat_module._AttachSessionInfo(
+            runner_online=False, agent_name=None, harness=None
+        ),
+    )
+    monkeypatch.setattr(chat_module, "_pick_agent", _no_prompt)
+    monkeypatch.setattr(chat_module, "_run_one_shot", _no_prompt)
+    monkeypatch.setattr(chat_module, "_run_repl", _no_prompt)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        chat_module._chat_with_server(
+            "http://127.0.0.1:6799",
+            None,
+            initial_message="hi",
+            **{session_kwarg: "conv_missing"},  # type: ignore[arg-type]
+        )
+
+    assert "conv_missing" in str(excinfo.value)
+    assert "--agent" not in str(excinfo.value)
+    assert suppresses_recovery_hint(excinfo.value)

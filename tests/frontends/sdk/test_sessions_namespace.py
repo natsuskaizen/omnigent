@@ -1687,3 +1687,21 @@ async def test_resolve_agent_on_server_without_user_scope_is_a_plain_miss(status
             await ns.resolve_agent("ghost")
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_on_server_ignoring_scope_lists_each_name_once() -> None:
+    """A server that ignores ``scope=user`` returns server agents twice; name them once."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        rows = [{"id": "id_scribe", "name": "scribe", "harness": "claude-sdk"}]
+        return httpx.Response(200, json={"data": rows, "has_more": False})
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(LookupError) as excinfo:
+            await ns.resolve_agent("ghost")
+    finally:
+        await client.aclose()
+
+    assert str(excinfo.value).count("scribe") == 1

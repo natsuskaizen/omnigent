@@ -7683,6 +7683,8 @@ _RESUME_SKIP_PARAMS: frozenset[str] = frozenset(
         "resume",
         "resume_latest",
         "fork_session_id",
+        # --agent picks the agent for a new session; resuming can't take it.
+        "agent_name",
         # ephemeral is session-scoped infrastructure flag, not
         # meaningful across invocations.
         "ephemeral",
@@ -8080,6 +8082,7 @@ def _validate_run_agent_flag(
     harness: str | None,
     from_openclaw: str | None,
     resume: str | None,
+    resume_latest: bool,
     fork_session_id: str | None,
 ) -> None:
     """
@@ -8091,6 +8094,7 @@ def _validate_run_agent_flag(
     :param harness: ``--harness`` value, or ``None``.
     :param from_openclaw: ``--from-openclaw`` value, or ``None``.
     :param resume: Raw ``--resume`` value (an id or the picker sentinel), or ``None``.
+    :param resume_latest: Whether ``--continue`` was given.
     :param fork_session_id: ``--fork`` value, or ``None``.
     :raises click.UsageError: If ``--agent`` can't apply to this invocation.
     """
@@ -8106,6 +8110,10 @@ def _validate_run_agent_flag(
         raise click.UsageError("--agent can't be combined with --from-openclaw.")
     if resume is not None:
         raise click.UsageError("--agent starts a new session; it can't be combined with --resume.")
+    if resume_latest:
+        raise click.UsageError(
+            "--agent starts a new session; it can't be combined with --continue."
+        )
     if fork_session_id is not None:
         raise click.UsageError("--agent starts a new session; it can't be combined with --fork.")
 
@@ -8765,6 +8773,7 @@ def run(
             harness=harness if harness_from_cli else None,
             from_openclaw=from_openclaw,
             resume=resume,
+            resume_latest=resume_latest,
             fork_session_id=fork_session_id,
         )
 

@@ -114,3 +114,17 @@ def test_host_names_are_escaped_in_the_message(monkeypatch: pytest.MonkeyPatch) 
 
     assert "\x1b" not in str(excinfo.value)
     assert "\\x1b" in str(excinfo.value)
+
+
+def test_host_listing_error_is_treated_as_no_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing ``GET /v1/hosts`` falls back to the plain "no online runner" error."""
+    from omnigent_client import OmnigentError
+
+    _local_host(monkeypatch, "host_local")
+
+    async def _broken(**_kwargs: object) -> list[LaunchHost]:
+        raise OmnigentError("forbidden")
+
+    sessions = SimpleNamespace(list_launch_hosts=_broken)
+
+    assert asyncio.run(resolve_remote_launch_host(sessions, harness="claude-sdk")) is None  # type: ignore[arg-type]

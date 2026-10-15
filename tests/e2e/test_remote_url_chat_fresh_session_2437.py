@@ -24,7 +24,11 @@ Run locally (mock LLM, no real API key needed)::
 from __future__ import annotations
 
 import asyncio
+import io
 import os
+import subprocess
+import sys
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,6 +38,7 @@ import pytest
 import yaml as _yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.live_server import isolated_local_server, local_server_env, terminate_process
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
@@ -488,3 +493,219 @@ def test_runner_adoption_matches_harness_aliases(agent_harness: str, advertised:
     assert asyncio.run(_resolve(lambda name: canonicalize_harness(name) or name)) == "r1"
     # Without canonicalization the alias would not match at all — the bug this guards.
     assert asyncio.run(_resolve(None)) is None
+
+
+# ---------------------------------------------------------------------------
+# Fresh server: registered agents, no sessions yet
+# ---------------------------------------------------------------------------
+
+_NO_SESSIONS_ERROR = "No sessions found on the server"
+_STALE_HOST_HINT = "stale host processes may be the cause"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _cli_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Isolate CLI and host state under *home*, sharing one host identity."""
+    home.mkdir(parents=True, exist_ok=True)
+    state = home / ".omnigent"
+    return local_server_env(
+        {
+            "HOME": str(home),
+            "OMNIGENT_DATA_DIR": str(state),
+            "OMNIGENT_CONFIG_HOME": str(state),
+            "TERM": "dumb",
+            **(extra or {}),
+        }
+    )
+
+
+def _run_cli(home: Path, *args: str, timeout: float = 180.0) -> subprocess.CompletedProcess[str]:
+    """Run ``omnigent <args>`` through ``main()``, so hints and the crash screen are observed."""
+    return subprocess.run(
+        [sys.executable, "-c", "from omnigent.cli import main\n\nmain()\n", *args],
+        env=_cli_env(home),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _session_count(base_url: str) -> int:
+    with httpx.Client(base_url=base_url, timeout=30.0) as client:
+        resp = client.get("/v1/sessions", params={"visibility": "all", "limit": 100})
+        resp.raise_for_status()
+        return len(resp.json()["data"])
+
+
+def _assert_clean_failure(proc: subprocess.CompletedProcess[str]) -> str:
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert _STALE_HOST_HINT not in output, output
+    assert "Traceback (most recent call last)" not in output, output
+    assert "crash report" not in output, output
+    return output
+
+
+def test_pick_agent_offers_registered_agents_before_any_session(
+    registered_agent_server: _RegisteredAgentServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery offers the server's agents on a server with no sessions yet."""
+    from omnigent.chat import _pick_agent
+
+    server = registered_agent_server
+    assert _session_count(server.base_url) == 0
+
+    # Built-ins are registered too, so answer the picker by name.
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{server.agent_name}\n"))
+    assert _pick_agent(server.base_url) == server.agent_name
+
+
+def test_run_one_shot_on_fresh_server_names_agents_and_the_selector(
+    registered_agent_server: _RegisteredAgentServer,
+    tmp_path: Path,
+) -> None:
+    """Headless ``run --server -p`` with several agents fails clearly instead of a menu."""
+    server = registered_agent_server
+
+    proc = _run_cli(tmp_path / "cli-home", "run", "--server", server.base_url, "-p", "hi")
+    output = _assert_clean_failure(proc)
+
+    assert _NO_SESSIONS_ERROR not in output, output
+    assert "Aborted!" not in output, output
+    assert "--agent <name>" in output, output
+    assert server.agent_name in output, output
+
+
+def test_run_one_shot_with_agent_on_fresh_server_answers(
+    registered_agent_server: _RegisteredAgentServer,
+    tmp_path: Path,
+) -> None:
+    """``run --server <url> --agent <name> -p`` answers through the server's runner."""
+    server = registered_agent_server
+    assert _session_count(server.base_url) == 0
+
+    proc = _run_cli(
+        tmp_path / "cli-home",
+        "run",
+        "--server",
+        server.base_url,
+        "--agent",
+        server.agent_name,
+        "-p",
+        "Say hello briefly.",
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert server.marker in proc.stdout, proc.stdout + proc.stderr
+    assert _session_count(server.base_url) == 1
+
+
+def test_run_with_unknown_agent_lists_registered_agents(
+    registered_agent_server: _RegisteredAgentServer,
+    tmp_path: Path,
+) -> None:
+    server = registered_agent_server
+
+    proc = _run_cli(
+        tmp_path / "cli-home", "run", "--server", server.base_url, "--agent", "nope", "-p", "hi"
+    )
+    output = _assert_clean_failure(proc)
+
+    assert "no agent named 'nope'" in output, output
+    assert server.agent_name in output, output
+    assert _session_count(server.base_url) == 0
+
+
+def test_run_one_shot_without_runner_or_host_fails_cleanly(tmp_path: Path) -> None:
+    """No online runner and no connected host is a CLI error, not a crash screen."""
+    with isolated_local_server(
+        tmp_path / "server",
+        extra_args=["--agent", str(_REPO_ROOT / "examples" / "scribe")],
+    ) as base_url:
+        proc = _run_cli(
+            tmp_path / "cli-home", "run", "--server", base_url, "--agent", "scribe", "-p", "hi"
+        )
+
+    output = _assert_clean_failure(proc)
+    assert "no online runner" in output, output
+
+
+def _wait_until(predicate: object, *, timeout: float, what: str) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():  # type: ignore[operator]
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def test_run_one_shot_launches_a_runner_on_this_machines_host(
+    mock_llm_server_url: str | None,
+    tmp_path: Path,
+) -> None:
+    """With only a connected host (no runner), the CLI has the server launch one there.
+
+    The CLI and ``omnigent host`` share a home, so the CLI is "this machine's"
+    host. The one-shot must answer through the launched runner and then stop it.
+    """
+    suffix = uuid.uuid4().hex[:6]
+    agent_name = f"host-launch-{suffix}"
+    model = f"mock-{suffix}"
+    marker = f"HOST_LAUNCH_OK_{suffix}"
+    yaml_path = _write_agent_yaml(
+        tmp_path, agent_name=agent_name, model=model, mock_llm_server_url=mock_llm_server_url
+    )
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, [{"text": marker}] * 4, key=model)
+    home = tmp_path / "cli-home"
+
+    with isolated_local_server(tmp_path / "server", extra_args=["--agent", str(yaml_path)]) as url:
+        host_log = (tmp_path / "host.log").open("w")
+        host = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from omnigent.cli import main\n\nmain()\n",
+                "host",
+                "--server",
+                url,
+                "--no-open",
+                "--non-interactive",
+            ],
+            env=_cli_env(home, {"OPENAI_API_KEY": "mock-key"}),
+            stdin=subprocess.DEVNULL,
+            stdout=host_log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            with httpx.Client(base_url=url, timeout=10.0) as client:
+
+                def _host_online() -> bool:
+                    hosts = client.get("/v1/hosts").json().get("hosts", [])
+                    return any(h.get("status") == "online" for h in hosts)
+
+                _wait_until(_host_online, timeout=90.0, what="the host to connect")
+                assert client.get("/v1/runners").json()["data"] == []
+
+                proc = _run_cli(home, "run", "--server", url, "--agent", agent_name, "-p", "hi")
+                output = proc.stdout + proc.stderr
+                assert proc.returncode == 0, output + (tmp_path / "host.log").read_text()
+                assert marker in proc.stdout, output
+
+                sessions = client.get(
+                    "/v1/sessions", params={"visibility": "all", "limit": 10}
+                ).json()["data"]
+                assert len(sessions) == 1 and sessions[0].get("host_id"), sessions
+                # The one-shot stops the runner it caused the host to launch.
+                _wait_until(
+                    lambda: (
+                        not any(r.get("online") for r in client.get("/v1/runners").json()["data"])
+                    ),
+                    timeout=60.0,
+                    what="the launched runner to stop",
+                )
+        finally:
+            terminate_process(host)
+            host_log.close()
