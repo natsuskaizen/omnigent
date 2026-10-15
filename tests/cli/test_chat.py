@@ -4670,3 +4670,470 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+# ---------------------------------------------------------------------------
+# Agent discovery for ``run --server <url>`` on a server with no sessions
+# ---------------------------------------------------------------------------
+
+
+class _ListingResp:
+    """``httpx.Response`` stand-in for the session and agent listings."""
+
+    def __init__(self, body: dict[str, object], status_code: int = 200) -> None:
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> dict[str, object]:
+        return self._body
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                "listing failed",
+                request=httpx.Request("GET", "http://srv"),
+                response=httpx.Response(self.status_code),
+            )
+
+
+def _fake_listings(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_agents: list[str],
+    agent_pages: list[list[str]],
+) -> list[dict[str, object]]:
+    """Serve ``GET /v1/sessions`` and a paged ``GET /v1/agents``; return agent-page params."""
+    agent_calls: list[dict[str, object]] = []
+
+    def _get(url: str, **kwargs: object) -> _ListingResp:
+        if url.endswith("/v1/sessions"):
+            return _ListingResp({"data": [{"agent_name": n} for n in session_agents]})
+        if url.endswith("/v1/agents"):
+            params = kwargs.get("params")
+            agent_calls.append(dict(params) if isinstance(params, dict) else {})
+            page = len(agent_calls) - 1
+            names = agent_pages[page]
+            has_more = page + 1 < len(agent_pages)
+            return _ListingResp(
+                {
+                    "data": [{"id": f"id_{n}", "name": n} for n in names],
+                    "has_more": has_more,
+                    "last_id": f"id_{names[-1]}" if names else None,
+                }
+            )
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+    return agent_calls
+
+
+def _no_prompt(*_args: object, **_kwargs: object) -> str:
+    raise AssertionError("agent discovery must not prompt here")
+
+
+def test_pick_agent_falls_back_to_server_agents_when_no_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server with registered agents but no sessions still yields an agent."""
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[["scribe"]])
+    monkeypatch.setattr(chat_module.click, "prompt", _no_prompt)
+
+    assert _pick_agent("http://127.0.0.1:6799") == "scribe"
+
+
+def test_pick_agent_follows_server_agent_listing_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server agents past the first listing page are still discovered."""
+    calls = _fake_listings(monkeypatch, session_agents=[], agent_pages=[["alpha"], ["beta"]])
+    monkeypatch.setattr(chat_module.click, "prompt", lambda *_a, **_kw: "beta")
+
+    assert _pick_agent("http://127.0.0.1:6799") == "beta"
+    assert calls[1].get("after") == "id_alpha"
+
+
+def test_pick_agent_headless_ambiguous_fails_instead_of_prompting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``-p`` with several candidate agents fails with the names, never a menu."""
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[["jcode", "scribe"]])
+    monkeypatch.setattr(chat_module.click, "prompt", _no_prompt)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("http://127.0.0.1:6799", quiet=True)
+
+    message = str(excinfo.value)
+    assert "jcode" in message and "scribe" in message
+    assert "--agent <name>" in message
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+def test_pick_agent_with_no_agents_anywhere_points_at_real_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No sessions and no server agents: the advice must be something that exists."""
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[[]])
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("http://127.0.0.1:6799")
+
+    message = str(excinfo.value)
+    assert "specify the agent with --agent" not in message
+    assert "agent add" in message
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+def test_chat_with_server_one_shot_picks_agent_without_prompting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``-p`` one-shot asks ``_pick_agent`` for the non-interactive mode."""
+    seen: dict[str, object] = {}
+
+    def _pick(base_url: str, *, quiet: bool = False) -> str:
+        seen["quiet"] = quiet
+        return "scribe"
+
+    monkeypatch.setattr(chat_module, "_pick_agent", _pick)
+    monkeypatch.setattr(
+        chat_module, "_run_one_shot", lambda **kw: seen.update(agent=kw["agent_name"])
+    )
+
+    chat_module._chat_with_server("http://127.0.0.1:6799", None, initial_message="hi")
+
+    assert seen == {"quiet": True, "agent": "scribe"}
+
+
+def test_run_chat_remote_explicit_agent_skips_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run --server <url> --agent NAME`` uses NAME without listing sessions."""
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[["jcode", "scribe"]])
+    monkeypatch.setattr(chat_module, "_pick_agent", _no_prompt)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(chat_module, "_run_one_shot", lambda **kw: captured.update(kw))
+
+    chat_module.run_chat(
+        target="http://127.0.0.1:6799",
+        client_tools=None,
+        prompt="hi",
+        agent_name="scribe",
+    )
+
+    assert captured["agent_name"] == "scribe"
+
+
+def test_run_chat_remote_unknown_agent_lists_registered_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``--agent`` name the server doesn't have fails before any session is made."""
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[["jcode", "scribe"]])
+    monkeypatch.setattr(chat_module, "_run_one_shot", _no_prompt)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        chat_module.run_chat(
+            target="http://127.0.0.1:6799",
+            client_tools=None,
+            prompt="hi",
+            agent_name="nope",
+        )
+
+    message = str(excinfo.value)
+    assert "nope" in message and "scribe" in message
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+def test_query_sessions_once_without_online_runner_is_a_clean_cli_error() -> None:
+    """No online runner for a remote agent is a ``ClickException``, not a crash."""
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    async def _resolve_agent(_name: str) -> SimpleNamespace:
+        return SimpleNamespace(id="id_scribe", harness="claude-sdk")
+
+    async def _no_runner(**_kwargs: object) -> None:
+        return None
+
+    async def _no_hosts(**_kwargs: object) -> list[object]:
+        return []
+
+    client = SimpleNamespace(
+        sessions=SimpleNamespace(
+            resolve_agent=_resolve_agent,
+            resolve_online_runner=_no_runner,
+            list_launch_hosts=_no_hosts,
+        )
+    )
+
+    with pytest.raises(click.ClickException, match="no online runner") as excinfo:
+        asyncio.run(
+            chat_module._query_sessions_once(
+                client=client,  # type: ignore[arg-type]
+                agent_name="scribe",
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+            )
+        )
+
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+class _StopAfterCreate(Exception):
+    """Ends ``_query_sessions_once`` once the session-create call is observed."""
+
+
+def _host_launch_client(
+    *,
+    hosts: list[object],
+    created: dict[str, object],
+    calls: list[str] | None = None,
+) -> SimpleNamespace:
+    """Sessions stub with no online runner; records calls and stops at create."""
+    calls = calls if calls is not None else []
+
+    async def _resolve_agent(_name: str) -> SimpleNamespace:
+        calls.append("resolve_agent")
+        return SimpleNamespace(id="id_scribe", harness="claude-sdk")
+
+    async def _no_runner(**_kwargs: object) -> None:
+        calls.append("resolve_online_runner")
+        return
+
+    async def _list_launch_hosts(**kwargs: object) -> list[object]:
+        calls.append("list_launch_hosts")
+        created["lookup"] = kwargs
+        return hosts
+
+    async def _create(agent_id: str, **kwargs: object) -> None:
+        created.update(kwargs, agent_id=agent_id)
+        raise _StopAfterCreate
+
+    async def _bind_runner(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a host-launched session is bound by the server")
+
+    return SimpleNamespace(
+        sessions=SimpleNamespace(
+            resolve_agent=_resolve_agent,
+            resolve_online_runner=_no_runner,
+            list_launch_hosts=_list_launch_hosts,
+            create_from_agent_id=_create,
+            bind_runner=_bind_runner,
+        )
+    )
+
+
+def _query_once(client: SimpleNamespace, **overrides: object) -> None:
+    kwargs: dict[str, object] = {
+        "agent_name": "scribe",
+        "tool_handler": None,
+        "prompt": "hi",
+        "session_bundle": None,
+        "session_bundle_filename": "agent.tar.gz",
+        "runner_id": None,
+    }
+    kwargs.update(overrides)
+    asyncio.run(chat_module._query_sessions_once(client=client, **kwargs))  # type: ignore[arg-type]
+
+
+def _local_host(monkeypatch: pytest.MonkeyPatch, host_id: str | None) -> None:
+    import omnigent.host.identity as identity
+
+    local = SimpleNamespace(host_id=host_id, name="me.local") if host_id else None
+    monkeypatch.setattr(identity, "load_host_identity_if_present", lambda *_a, **_kw: local)
+
+
+def test_query_sessions_once_launches_on_this_host_when_no_runner_is_online(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No online runner but this machine is a connected host: the server launches one."""
+    from omnigent_client import LaunchHost
+
+    _local_host(monkeypatch, "host_local")
+    created: dict[str, object] = {}
+
+    with pytest.raises(_StopAfterCreate):
+        _query_once(
+            _host_launch_client(hosts=[LaunchHost("host_local", "me.local")], created=created)
+        )
+
+    assert created["lookup"]["harness"] == "claude-sdk"  # type: ignore[index]
+    assert created["agent_id"] == "id_scribe"
+    assert created["host_id"] == "host_local"
+
+
+def test_query_sessions_once_only_other_hosts_connected_is_a_clean_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hosts on other machines can't use this directory, so name them instead."""
+    from omnigent_client import LaunchHost
+
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _local_host(monkeypatch, None)
+    created: dict[str, object] = {}
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _query_once(
+            _host_launch_client(hosts=[LaunchHost("host_dev", "devbox.local")], created=created)
+        )
+
+    message = str(excinfo.value)
+    assert "devbox.local" in message and "host --server" in message
+    assert suppresses_recovery_hint(excinfo.value)
+    assert "agent_id" not in created
+
+
+def test_query_sessions_once_resume_without_runner_never_launches_on_a_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resumed session keeps its own agent/host; a missing runner is just reported."""
+    from omnigent_client import LaunchHost
+
+    _local_host(monkeypatch, "host_local")
+    calls: list[str] = []
+
+    with pytest.raises(click.ClickException, match="no online runner"):
+        _query_once(
+            _host_launch_client(
+                hosts=[LaunchHost("host_local", "me.local")], created={}, calls=calls
+            ),
+            resume_conversation_id="conv_x",
+        )
+
+    assert "list_launch_hosts" not in calls
+
+
+def test_query_sessions_once_bundle_path_is_unchanged() -> None:
+    """A local bundle without a runner id still fails on the runner precondition."""
+    calls: list[str] = []
+
+    with pytest.raises(RuntimeError, match="requires a registered runner id"):
+        _query_once(
+            _host_launch_client(hosts=[], created={}, calls=calls),
+            session_bundle=b"bundle",
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("session_kwarg", "runner"),
+    [("resume_conversation_id", "_run_one_shot"), ("fork_session_id", "_run_repl")],
+)
+def test_chat_with_server_existing_session_uses_its_own_agent(
+    session_kwarg: str, runner: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resuming or forking never asks which agent: the session already has one."""
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
+    monkeypatch.setattr(
+        chat_module,
+        "_attach_session_info",
+        lambda **_kw: chat_module._AttachSessionInfo(
+            runner_online=True, agent_name="scribe", harness="claude-sdk"
+        ),
+    )
+    monkeypatch.setattr(chat_module, "_pick_agent", _no_prompt)
+    seen: dict[str, object] = {}
+
+    def _record(*args: object, **kwargs: object) -> None:
+        seen["agent"] = kwargs.get("agent_name", args[1] if len(args) > 1 else None)
+
+    monkeypatch.setattr(chat_module, runner, _record)
+    initial = "hi" if runner == "_run_one_shot" else None
+
+    chat_module._chat_with_server(
+        "http://127.0.0.1:6799",
+        None,
+        initial_message=initial,
+        **{session_kwarg: "conv_x"},  # type: ignore[arg-type]
+    )
+
+    assert seen["agent"] == "scribe"
+
+
+def test_pick_agent_ignores_session_agents_the_server_cannot_launch_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session-scoped (uploaded) agents aren't in ``/v1/agents`` and can't be resolved."""
+    _fake_listings(monkeypatch, session_agents=["uploaded_yaml_agent"], agent_pages=[["scribe"]])
+    monkeypatch.setattr(chat_module.click, "prompt", _no_prompt)
+
+    assert _pick_agent("http://127.0.0.1:6799", quiet=True) == "scribe"
+
+
+def test_pick_agent_keeps_session_agents_when_server_lists_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server without ``/v1/agents`` falls back to session-discovered names as before."""
+
+    def _get(url: str, **_kwargs: object) -> _ListingResp:
+        if url.endswith("/v1/sessions"):
+            return _ListingResp({"data": [{"agent_name": "scribe"}]})
+        return _ListingResp({}, status_code=404)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    assert _pick_agent("http://127.0.0.1:6799", quiet=True) == "scribe"
+
+
+def test_pick_agent_headless_single_agent_prints_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``-p`` stdout carries only the reply, so the auto-pick isn't announced."""
+    _fake_listings(monkeypatch, session_agents=["scribe"], agent_pages=[["scribe", "jcode"]])
+
+    assert _pick_agent("http://127.0.0.1:6799", quiet=True) == "scribe"
+    assert capsys.readouterr().out == ""
+
+
+def test_list_server_agent_names_on_server_without_route_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        chat_module.httpx, "get", lambda *_a, **_kw: _ListingResp({}, status_code=404)
+    )
+
+    assert chat_module._list_server_agent_names("http://127.0.0.1:6799") == []
+
+
+def test_list_server_agent_names_unreachable_server_is_a_click_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _refused(*_args: object, **_kwargs: object) -> object:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(chat_module.httpx, "get", _refused)
+
+    with pytest.raises(click.ClickException, match=r"127\.0\.0\.1:6799"):
+        chat_module._list_server_agent_names("http://127.0.0.1:6799")
+
+
+def test_list_server_agent_names_server_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        chat_module.httpx, "get", lambda *_a, **_kw: _ListingResp({}, status_code=500)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        chat_module._list_server_agent_names("http://127.0.0.1:6799")
+
+
+def test_list_server_agent_names_stops_when_cursor_does_not_advance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    def _get(_url: str, **kwargs: object) -> _ListingResp:
+        calls.append(kwargs.get("params"))
+        return _ListingResp({"data": [{"name": "a"}], "has_more": True, "last_id": "id_a"})
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    assert chat_module._list_server_agent_names("http://127.0.0.1:6799") == ["a"]
+    assert len(calls) == 2

@@ -7440,6 +7440,10 @@ def _run_smart_routing_removed() -> str:
 
 
 _FORK_HELP = "Fork an existing session by id and open the REPL on the fork."
+_RUN_AGENT_HELP = (
+    "Name of a server agent to start the new session with. Only with --server "
+    "<url> and no AGENT path; discovered from the server when omitted."
+)
 _LOG_HELP = "Write a JSON dump of the conversation to ~/.omnigent/logs/ on exit."
 
 
@@ -8067,6 +8071,44 @@ def _reject_agent_with_native_terminal_harness(harness: str) -> None:
     )
 
 
+def _validate_run_agent_flag(
+    *,
+    target: str | None,
+    server: str | None,
+    server_from_cli: bool,
+    harness: str | None,
+    from_openclaw: str | None,
+    resume: str | None,
+    fork_session_id: str | None,
+) -> None:
+    """
+    Reject ``--agent`` outside a new direct ``--server`` session.
+
+    :param target: AGENT path, or ``None``.
+    :param server: Resolved server URL, or ``None`` for local mode.
+    :param server_from_cli: Whether ``--server`` was given explicitly.
+    :param harness: ``--harness`` value, or ``None``.
+    :param from_openclaw: ``--from-openclaw`` value, or ``None``.
+    :param resume: Raw ``--resume`` value (an id or the picker sentinel), or ``None``.
+    :param fork_session_id: ``--fork`` value, or ``None``.
+    :raises click.UsageError: If ``--agent`` can't apply to this invocation.
+    """
+    if target is not None:
+        raise click.UsageError(
+            "--agent can't be combined with an AGENT path, which names the agent."
+        )
+    if not (server_from_cli and server):
+        raise click.UsageError("--agent picks a server agent, so it requires --server <url>.")
+    if harness is not None:
+        raise click.UsageError("--agent can't be combined with --harness.")
+    if from_openclaw is not None:
+        raise click.UsageError("--agent can't be combined with --from-openclaw.")
+    if resume is not None:
+        raise click.UsageError("--agent starts a new session; it can't be combined with --resume.")
+    if fork_session_id is not None:
+        raise click.UsageError("--agent starts a new session; it can't be combined with --fork.")
+
+
 def _dispatch_run(
     *,
     target: str | None,
@@ -8088,6 +8130,7 @@ def _dispatch_run(
     server_from_cli: bool = False,
     model_from_cli: bool = False,
     acp_agent: AcpAgentEntry | None = None,
+    agent_name: str | None = None,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -8134,6 +8177,8 @@ def _dispatch_run(
         on the command line rather than loaded from config.
     :param acp_agent: Optional one-shot ACP agent carried in the generated
         temporary spec instead of loaded from global config.
+    :param agent_name: ``--agent`` value: the server agent for a new direct
+        ``--server`` session, e.g. ``"scribe"``.
     """
     if target is not None and _is_server_url(target):
         raise click.ClickException(
@@ -8218,6 +8263,7 @@ def _dispatch_run(
                 debug_events=debug_events,
                 resume_parts=resume_parts,
                 auto_open_conversation=auto_open_conversation,
+                agent_name=agent_name,
             )
             return
         if harness is None:
@@ -8573,6 +8619,7 @@ def attach(
     "-c", "--continue", "resume_latest", is_flag=True, default=False, help=_CONTINUE_HELP
 )
 @click.option("--fork", "fork_session_id", default=None, help=_FORK_HELP)
+@click.option("--agent", "agent_name", default=None, metavar="NAME", help=_RUN_AGENT_HELP)
 @click.option("--no-session", "ephemeral", is_flag=True, default=False, help=_NO_SESSION_HELP)
 @click.option("--log/--no-log", "log", default=False, help=_LOG_HELP)
 @click.option(
@@ -8633,6 +8680,7 @@ def run(
     resume: str | None,
     resume_latest: bool,
     fork_session_id: str | None,
+    agent_name: str | None,
     ephemeral: bool,
     log: bool,
     server: str | None,
@@ -8660,6 +8708,7 @@ def run(
       omnigent run examples/hello_world.yaml
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
       omnigent run --server http://localhost:6767
+      omnigent run --server http://localhost:6767 --agent scribe -p "hi"
       omnigent run --server local  # local server, ignoring any configured default
       omnigent run examples/databricks_coding_agent.yaml --server https://<app>.databricksapps.com
       omnigent run --server https://<app>.databricksapps.com --profile my-sp -p "hi"
@@ -8706,6 +8755,17 @@ def run(
     model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
     harness_from_cli = harness_source is not None and harness_source.name == "COMMANDLINE"
+    # Checked against what was typed, before config defaults fill in an agent.
+    if agent_name is not None:
+        _validate_run_agent_flag(
+            target=target,
+            server=server,
+            server_from_cli=server_from_cli,
+            harness=harness if harness_from_cli else None,
+            from_openclaw=from_openclaw,
+            resume=resume,
+            fork_session_id=fork_session_id,
+        )
 
     acp_agent: AcpAgentEntry | None = None
     if from_openclaw is not None:
@@ -8803,6 +8863,7 @@ def run(
         server_from_cli=server_from_cli,
         model_from_cli=model_from_cli,
         acp_agent=acp_agent,
+        agent_name=agent_name,
     )
 
 

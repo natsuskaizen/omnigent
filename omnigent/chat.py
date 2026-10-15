@@ -315,6 +315,7 @@ def run_chat(
     debug_events: bool = False,
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
+    agent_name: str | None = None,
 ) -> None:
     """
     Main entry point for ``omnigent run`` (and the ``attach`` client).
@@ -391,6 +392,8 @@ def run_chat(
         resume hint on exit.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL when the session id becomes known.
+    :param agent_name: Server agent for a new session on a URL *target*,
+        e.g. ``"scribe"``. ``None`` discovers one with :func:`_pick_agent`.
     """
     # Client-side tools are a CLI/TUI convenience (e.g. shell access
     # for coding agents). They don't affect agent behavior — the spec
@@ -433,12 +436,15 @@ def run_chat(
         # commands work even when connecting to a remote server with no
         # local agent spec.
         host_skills = discover_host_skills(Path.cwd(), "all")
+        if agent_name is not None:
+            _require_server_agent(target.rstrip("/"), agent_name)
         _chat_with_server(
             target,
             tool_handler,
             initial_message=prompt,
             resume_conversation_id=resume_conversation_id,
             fork_session_id=fork_session_id,
+            agent_name=agent_name,
             debug_events=debug_events,
             resume_parts=resume_parts,
             skills=host_skills or None,
@@ -1072,7 +1078,14 @@ def _chat_with_server(
     ):
         return
 
-    selected_agent = agent_name or _pick_agent(base_url)
+    existing_session_id = resume_conversation_id or fork_session_id
+    if agent_name is None and existing_session_id is not None:
+        # Resuming or forking keeps the session's own agent.
+        agent_name = _attach_session_info(
+            base_url=base_url, conversation_id=existing_session_id
+        ).agent_name
+    # A one-shot ``-p`` has no one to answer a picker menu.
+    selected_agent = agent_name or _pick_agent(base_url, quiet=initial_message is not None)
 
     # Bring-up is done — clear the spinner the instant before we produce
     # terminal output (the one-shot reply or the REPL's first paint), so it
@@ -1387,20 +1400,107 @@ def _attach_session_info(
     )
 
 
+_SERVER_AGENT_PAGE_LIMIT = 1000
+_SERVER_AGENT_MAX_PAGES = 20
+_AGENT_NAMES_IN_ERROR = 20
+
+
+def _remote_run_error(message: str) -> click.ClickException:
+    """A ``run --server`` error the stale-host recovery hint can't fix."""
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    exc = click.ClickException(message)
+    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
+
+
+def _format_agent_names(names: list[str]) -> str:
+    """Join agent names for an error message, capping a long list."""
+    shown = ", ".join(names[:_AGENT_NAMES_IN_ERROR])
+    extra = len(names) - _AGENT_NAMES_IN_ERROR
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _list_server_agent_names(base_url: str) -> list[str]:
+    """
+    List the server agents a fresh session can bind to by name.
+
+    Pages through ``GET /v1/agents`` — the same listing the web UI's
+    new-session picker and ``sessions.resolve_agent`` use. A server too old
+    to serve the route lists nothing rather than failing discovery.
+
+    :param base_url: Server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :returns: Unique agent names in listing order, e.g. ``["scribe"]``.
+    :raises click.ClickException: If the server is unreachable.
+    :raises httpx.HTTPStatusError: If the listing returns another error.
+    """
+    names: list[str] = []
+    after: str | None = None
+    for _ in range(_SERVER_AGENT_MAX_PAGES):
+        params: dict[str, str | int] = {"limit": _SERVER_AGENT_PAGE_LIMIT}
+        if after is not None:
+            params["after"] = after
+        try:
+            resp = _server_get(
+                f"{base_url}/v1/agents",
+                headers=_remote_headers(server_url=base_url, host_id=None),
+                params=params,
+                timeout=10.0,
+            )
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ProxyError,
+            httpx.InvalidURL,
+        ) as exc:
+            raise click.ClickException(_unreachable_server_message(base_url)) from exc
+        if resp.status_code == 404:
+            return names
+        resp.raise_for_status()
+        listing = resp.json()
+        for item in listing.get("data", []):
+            name = item.get("name") if isinstance(item, dict) else None
+            if isinstance(name, str) and name and name not in names:
+                names.append(name)
+        last_id = listing.get("last_id")
+        if not listing.get("has_more") or not last_id or last_id == after:
+            break
+        after = last_id
+    return names
+
+
+def _require_server_agent(base_url: str, agent_name: str) -> None:
+    """
+    Fail before creating a session when the server has no agent *agent_name*.
+
+    :param base_url: Server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param agent_name: Name passed to ``run --agent``, e.g. ``"scribe"``.
+    :raises click.ClickException: If no server agent has that name.
+    """
+    names = _list_server_agent_names(base_url)
+    if agent_name in names:
+        return
+    available = _format_agent_names(names) if names else "none"
+    raise _remote_run_error(
+        f"The server at {base_url} has no agent named {agent_name!r}. "
+        f"Registered agents: {available}."
+    )
+
+
 def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
     """
-    Discover agent names from existing sessions and let the user pick.
+    Choose the agent for a new ``run --server <url>`` session.
 
-    If only one agent name is found, selects it automatically.
-    Falls back to requiring the user to specify ``--agent`` if no
-    sessions exist yet.
+    Prefers server agents that existing sessions used; otherwise offers all of
+    the server's registered agents. One candidate is selected automatically;
+    several prompt the user unless *quiet*.
 
     :param base_url: Server base URL.
-    :param quiet: When ``True``, suppress interactive prompts and
-        auto-select the first available agent.
+    :param quiet: When ``True`` (headless ``-p``), never prompt: several
+        candidates fail with the names and the ``--agent`` fix instead.
     :returns: The chosen agent name.
-    :raises click.ClickException: If the server is unreachable, no
-        sessions exist, or no agent name can be discovered.
+    :raises click.ClickException: If the server is unreachable, it has no
+        agents at all, or *quiet* is set and the choice is ambiguous.
     """
     try:
         resp = _server_get(
@@ -1427,16 +1527,29 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
             names.append(name)
             seen.add(name)
 
+    # Only server agents can start a new session by name; sessions may also
+    # carry session-scoped (uploaded) agents. A fresh server has no sessions.
+    server_names = _list_server_agent_names(base_url)
+    if server_names:
+        names = [name for name in names if name in server_names] or server_names
+        seen = set(names)
+
     if not names:
-        raise click.ClickException(
-            "No sessions found on the server. Start a session first "
-            "or specify the agent with --agent."
+        raise _remote_run_error(
+            f"The server at {base_url} has no agents. Install one with "
+            f"`{cli_invocation()} agent add <path> --server {base_url}`, then retry."
         )
 
     if len(names) == 1:
         if not quiet:
             click.echo(f"\n  Agent: {names[0]}")
         return names[0]
+
+    if quiet:
+        raise _remote_run_error(
+            f"The server at {base_url} has several agents: {_format_agent_names(names)}. "
+            f"Pick one with `{cli_invocation()} run --server {base_url} --agent <name>`."
+        )
 
     click.echo("\n  Available agents:\n")
     for i, name in enumerate(names, 1):
@@ -2370,30 +2483,52 @@ async def _query_sessions_once(
     """
     from omnigent_client import SessionsChat
 
+    from omnigent.remote_launch import (
+        RemoteLaunchHostError,
+        remote_launch_host_message,
+        resolve_remote_launch_host,
+    )
+
     # Remote target: no local bundle means no local runner either, so
     # adopt one the server already has online before the dispatch
     # precondition is checked.
     agent: RegisteredAgent | None = None
+    launch_host_id: str | None = None
     if runner_id is None and session_bundle is None:
         agent = await client.sessions.resolve_agent(agent_name)
         runner_id = await client.sessions.resolve_online_runner(
             harness=agent.harness,
             canonicalize=lambda name: canonicalize_harness(name) or name,
         )
-        if runner_id is None:
-            raise RuntimeError(
+        if runner_id is None and resume_conversation_id is None:
+            # No runner yet: have the server launch one on a connected host.
+            try:
+                launch_host_id = await resolve_remote_launch_host(
+                    client.sessions, harness=agent.harness
+                )
+            except RemoteLaunchHostError as exc:
+                raise _remote_run_error(remote_launch_host_message(exc)) from exc
+        if runner_id is None and launch_host_id is None:
+            raise _remote_run_error(
                 "This server has no online runner to run the turn. Start one against "
                 f"it with `{cli_invocation()} host --server <url>` (or run the agent locally "
                 f"with `{cli_invocation()} run <agent.yaml>`), then retry."
             )
-    if runner_id is None:
+    tool_callables = _sessions_tool_callables(tool_handler, agent_name)
+    if launch_host_id is not None and agent is not None:
+        # The server launches and binds the host's runner itself.
+        bound = await client.sessions.create_from_agent_id(
+            agent.id,
+            workspace=os.getcwd(),
+            host_id=launch_host_id,
+        )
+    elif runner_id is None:
         raise RuntimeError(
             "Sessions API headless prompt requires a registered runner id. "
             f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
             "can launch and bind a runner."
         )
-    tool_callables = _sessions_tool_callables(tool_handler, agent_name)
-    if resume_conversation_id is not None:
+    elif resume_conversation_id is not None:
         bound = await client.sessions.get(resume_conversation_id)
         await client.sessions.bind_runner(resume_conversation_id, runner_id=runner_id)
     else:

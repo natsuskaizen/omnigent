@@ -1468,3 +1468,147 @@ async def test_list_preserves_host_id_on_rows() -> None:
     assert by_id["conv_unbound"].parent_session_id is None
     assert by_id["conv_child"].host_id is None
     assert by_id["conv_child"].parent_session_id == "conv_host_bound"
+
+
+# ── create_from_agent_id() / list_launch_hosts() ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_from_agent_id_sends_host_id_when_given() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json=_session_response_body(status="idle"))
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.create_from_agent_id("ag_abc", workspace="/w", host_id="host_1")
+    finally:
+        await client.aclose()
+
+    assert captured["body"] == {"agent_id": "ag_abc", "workspace": "/w", "host_id": "host_1"}
+
+
+@pytest.mark.asyncio
+async def test_create_from_agent_id_omits_host_id_by_default() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json=_session_response_body(status="idle"))
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.create_from_agent_id("ag_abc")
+    finally:
+        await client.aclose()
+
+    assert "host_id" not in captured["body"]
+
+
+def _host(
+    host_id: str,
+    *,
+    status: str = "online",
+    sandbox_provider: str | None = None,
+    harnesses: dict[str, object] | None = None,
+    name: str | None = "",
+) -> dict[str, object]:
+    """Build one ``GET /v1/hosts`` row; ``name=""`` means ``<host_id>.local``."""
+    return {
+        "host_id": host_id,
+        "name": f"{host_id}.local" if name == "" else name,
+        "status": status,
+        "sandbox_provider": sandbox_provider,
+        "configured_harnesses": harnesses,
+    }
+
+
+async def _launch_hosts(
+    body: object,
+    *,
+    status_code: int = 200,
+    **kwargs: Any,
+) -> list[tuple[str, str]]:
+    """Run ``list_launch_hosts`` against a mocked ``GET /v1/hosts``; return (id, name) pairs."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/hosts"
+        return httpx.Response(status_code, json=body)
+
+    ns, client = _make_namespace(handler)
+    try:
+        hosts = await ns.list_launch_hosts(**kwargs)
+    finally:
+        await client.aclose()
+    return [(h.host_id, h.name) for h in hosts]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_skips_hosts_that_cannot_launch() -> None:
+    hosts = [
+        _host("offline", status="offline", harnesses={"claude-sdk": True}),
+        _host("sandbox", sandbox_provider="modal", harnesses={"claude-sdk": True}),
+        _host("missing", harnesses={"claude-sdk": "binary-missing"}),
+        _host("disabled", harnesses={"claude-sdk": False}),
+        _host("needs_auth", harnesses={"claude-sdk": "needs-auth"}),
+    ]
+
+    assert await _launch_hosts({"hosts": hosts}, harness="claude-sdk") == [
+        ("needs_auth", "needs_auth.local")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_accepts_unknown_readiness() -> None:
+    """A host that hasn't reported readiness for the harness may still launch it."""
+    hosts = [_host("h1", harnesses=None), _host("h2", harnesses={"codex": False})]
+
+    assert [h for h, _ in await _launch_hosts({"hosts": hosts}, harness="claude-sdk")] == [
+        "h1",
+        "h2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_matches_canonical_harness_name() -> None:
+    hosts = [_host("h1", harnesses={"claude-sdk": False}), _host("h2", harnesses={"claude": True})]
+
+    listed = await _launch_hosts(
+        {"hosts": hosts},
+        harness="claude-sdk",
+        canonicalize=lambda name: "claude-sdk" if name == "claude" else name,
+    )
+
+    # h1 marks the canonical name unavailable; h2 is ready under its alias.
+    assert [h for h, _ in listed] == ["h2"]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_skips_malformed_rows_and_names_by_id() -> None:
+    hosts: list[object] = [
+        "not-a-row",
+        {"status": "online"},
+        _host(""),
+        _host("unnamed", name=None),
+        _host("ok"),
+    ]
+
+    assert await _launch_hosts({"hosts": hosts}) == [("unnamed", "unnamed"), ("ok", "ok.local")]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_tolerates_a_non_list_listing() -> None:
+    assert await _launch_hosts({"hosts": {"oops": True}}) == []
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_on_server_without_hosts_route_is_empty() -> None:
+    assert await _launch_hosts({}, status_code=404) == []
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_server_error_raises() -> None:
+    with pytest.raises(OmnigentError):
+        await _launch_hosts({}, status_code=500)

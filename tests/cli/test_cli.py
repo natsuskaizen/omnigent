@@ -5057,7 +5057,114 @@ def test_run_server_without_agent_dispatches_direct_server(
         # Interactive ``run --server`` (no -p) defaults the browser-open ON,
         # including for remote servers.
         auto_open_conversation=True,
+        agent_name=None,
     )
+
+
+def test_run_server_agent_flag_forwards_agent_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run --server URL --agent NAME`` hands NAME to the direct-server chat."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "scribe", "-p", "hi"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert run_chat.call_args.kwargs["agent_name"] == "scribe"
+    assert run_chat.call_args.kwargs["prompt"] == "hi"
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        # No --server: there's no server whose agents NAME could refer to.
+        (["run", "--agent", "scribe"], "--server"),
+        # A local AGENT path already names the agent.
+        (
+            [
+                "run",
+                "tests/resources/examples/hello_world.yaml",
+                "--server",
+                "http://localhost:8000",
+                "--agent",
+                "scribe",
+            ],
+            "AGENT path",
+        ),
+        # Resume/fork reuse the existing session's agent.
+        (
+            ["run", "--server", "http://localhost:8000", "--agent", "scribe", "--resume", "c1"],
+            "--resume",
+        ),
+        (
+            ["run", "--server", "http://localhost:8000", "--agent", "scribe", "--fork", "c1"],
+            "--fork",
+        ),
+        # A harness launcher has no server agent to pick.
+        (
+            [
+                "run",
+                "--server",
+                "http://localhost:8000",
+                "--agent",
+                "scribe",
+                "--harness",
+                "codex",
+            ],
+            "--harness",
+        ),
+        (
+            [
+                "run",
+                "--server",
+                "http://localhost:8000",
+                "--agent",
+                "scribe",
+                "--from-openclaw",
+                "Gemini CLI",
+            ],
+            "--from-openclaw",
+        ),
+    ],
+)
+def test_run_agent_flag_rejected_outside_direct_server_new_session(
+    args: list[str], expected: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--agent`` only picks the agent for a new direct ``--server`` session."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    run_attach = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+    monkeypatch.setattr("omnigent.chat.run_attach", run_attach)
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code != 0
+    assert "--agent" in result.output and expected in result.output
+    run_chat.assert_not_called()
+    run_attach.assert_not_called()
+
+
+def test_run_agent_flag_needs_explicit_server_not_config_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured default server isn't direct-server mode, so ``--agent`` can't apply."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda *_a, **_kw: {"server": "https://configured.example.com"},
+    )
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(cli, ["run", "--agent", "scribe", "-p", "hi"])
+
+    assert result.exit_code != 0
+    assert "requires --server" in result.output
+    run_chat.assert_not_called()
 
 
 @pytest.mark.parametrize("alias", ["", "local", "LOCAL", " local "])

@@ -327,6 +327,25 @@ class SessionListItem:
         )
 
 
+# Host readiness values meaning the harness can't run there at all.
+_UNLAUNCHABLE_READINESS: frozenset[object] = frozenset({False, "binary-missing"})
+
+
+@dataclass(frozen=True)
+class LaunchHost:
+    """
+    A connected host the server can launch a session's runner on.
+
+    :param host_id: Durable host identifier, e.g.
+        ``"a1b2c3d4e5f67890abcdef1234567890"``.
+    :param name: Display name, e.g. ``"laptop.local"``; the id when the
+        host reported none.
+    """
+
+    host_id: str
+    name: str
+
+
 @dataclass(frozen=True)
 class RegisteredAgent:
     """
@@ -450,6 +469,7 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_id: str | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -470,6 +490,9 @@ class SessionsNamespace:
             effort, e.g. ``"high"``. ``None`` uses the agent default.
         :param workspace: Optional absolute starting cwd to record on
             the session, e.g. ``"/Users/corey/projects/myapp"``.
+        :param host_id: Optional connected host to launch the session's
+            runner on, e.g. ``"a1b2c3d4e5f67890abcdef1234567890"``. The
+            server launches and binds that runner itself.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status.
@@ -483,6 +506,8 @@ class SessionsNamespace:
             body["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             body["workspace"] = workspace
+        if host_id is not None:
+            body["host_id"] = host_id
         resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
@@ -618,6 +643,65 @@ class SessionsNamespace:
             if wanted & names:
                 return runner_id
         return unknown_harness
+
+    async def list_launch_hosts(
+        self,
+        *,
+        harness: str | None = None,
+        canonicalize: Callable[[str], str] | None = None,
+    ) -> list[LaunchHost]:
+        """
+        List connected hosts the server could launch a runner on for *harness*.
+
+        The fallback when :meth:`resolve_online_runner` finds no runner:
+        creating the session with one of these host ids makes the server
+        launch a runner there, as the web UI's new-session flow does.
+        Candidates are online hosts that aren't server-managed sandboxes and
+        don't report *harness* as unavailable; a host that hasn't reported
+        its readiness for *harness* still counts.
+
+        :param harness: Harness the session needs, e.g. ``"claude-sdk"``.
+            ``None`` accepts any candidate host.
+        :param canonicalize: Optional harness-name normalizer applied to
+            both sides, as in :meth:`resolve_online_runner`.
+        :returns: Candidate hosts in listing order; empty when there are
+            none or the server predates ``GET /v1/hosts``.
+        :raises OmnigentError: If the listing returns another non-2xx status.
+        """
+        resp = await self._http.get(f"{self._base}/v1/hosts")
+        if resp.status_code == 404:
+            return []
+        raise_for_status(resp.status_code, response_body(resp))
+        listing = require_json_object(resp, "GET /v1/hosts")
+        hosts = listing.get("hosts", [])
+
+        def _norm(name: str) -> str:
+            return canonicalize(name) if canonicalize is not None else name
+
+        wanted = {harness, _norm(harness)} if harness is not None else set()
+        candidates: list[LaunchHost] = []
+        for item in hosts if isinstance(hosts, list) else []:
+            if not isinstance(item, dict) or item.get("status") != "online":
+                continue
+            if item.get("sandbox_provider") is not None:
+                continue
+            host_id = item.get("host_id")
+            if not isinstance(host_id, str) or not host_id:
+                continue
+            readiness = item.get("configured_harnesses")
+            if wanted and isinstance(readiness, dict):
+                matches = [
+                    value
+                    for name, value in readiness.items()
+                    if isinstance(name, str) and (name in wanted or _norm(name) in wanted)
+                ]
+                if matches and all(value in _UNLAUNCHABLE_READINESS for value in matches):
+                    continue
+            name = item.get("name")
+            candidates.append(
+                LaunchHost(host_id, name if isinstance(name, str) and name else host_id)
+            )
+        return candidates
 
     async def list(
         self,

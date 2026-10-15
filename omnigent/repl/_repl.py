@@ -1767,6 +1767,23 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
+        launch_host_id: str | None = None
+        if self._runner_id is None:
+            from omnigent.remote_launch import (
+                RemoteLaunchHostError,
+                remote_launch_host_message,
+                resolve_remote_launch_host,
+            )
+
+            # No runner yet: the server launches one on a connected host and
+            # binds it, so hydrating the snapshot below picks it up.
+            try:
+                launch_host_id = await resolve_remote_launch_host(
+                    self._client.sessions,
+                    harness=agent.harness if agent is not None else None,
+                )
+            except RemoteLaunchHostError as exc:
+                raise RuntimeError(remote_launch_host_message(exc)) from exc
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
@@ -1774,6 +1791,7 @@ class _SessionsChatReplAdapter:
             agent_id,
             reasoning_effort=self._reasoning_effort,
             workspace=os.getcwd(),
+            host_id=launch_host_id,
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
