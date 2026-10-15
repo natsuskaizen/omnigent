@@ -50,6 +50,7 @@ from omnigent.cli_config import (
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
 )
+from omnigent.cli_diagnostics import cli_error_without_recovery_hint, printable
 from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
 from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
@@ -11707,15 +11708,6 @@ _AGENT_SERVER_OPTION = click.option(
 )
 
 
-def _agent_cli_error(message: str) -> click.ClickException:
-    """An ``omnigent agent`` error; the stale-host recovery hint can't fix these."""
-    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
-
-    exc = click.ClickException(message)
-    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
-    return exc
-
-
 @contextlib.contextmanager
 def _agent_api_client(server: str | None) -> Iterator[Any]:  # type: ignore[explicit-any]  # httpx imported lazily
     """Yield an authenticated client for ``/v1/agents`` on the resolved server."""
@@ -11743,7 +11735,7 @@ def _agent_api_client(server: str | None) -> Iterator[Any]:  # type: ignore[expl
         # 405 or reporting an empty list.
         info = client.get("/v1/info")
         if not (info.is_success and info.json().get("agent_install") is True):
-            raise _agent_cli_error(
+            raise cli_error_without_recovery_hint(
                 f"{base_url} does not support installing agents; upgrade the server "
                 "to use `omnigent agent`."
             )
@@ -11759,7 +11751,7 @@ def _raise_for_agent_api(resp: Any) -> None:  # type: ignore[explicit-any]  # ht
         detail = body.get("error", {}).get("message") or body.get("detail") or resp.text
     except (ValueError, AttributeError):  # non-JSON, or JSON of an unexpected shape
         detail = resp.text
-    raise _agent_cli_error(f"{resp.status_code}: {detail}")
+    raise cli_error_without_recovery_hint(f"{resp.status_code}: {detail}")
 
 
 @cli.group("agent")
@@ -11799,8 +11791,8 @@ def _find_agent_dirs(root: Path) -> list[Path]:
             continue
         if cfg.is_symlink():
             # Checked before anything reads it, so even --list can't follow it.
-            raise _agent_cli_error(
-                f"{_printable(cfg.relative_to(root).as_posix())} is a symlink; refusing to "
+            raise cli_error_without_recovery_hint(
+                f"{printable(cfg.relative_to(root).as_posix())} is a symlink; refusing to "
                 "read an agent config through a symlink from a remote repo."
             )
         found.append(cfg.parent)
@@ -11814,11 +11806,6 @@ def _agent_dir_name(agent_dir: Path) -> str:
     except (yaml.YAMLError, AttributeError, OSError, ValueError):  # ValueError: bad UTF-8
         name = None
     return name if isinstance(name, str) and name else agent_dir.name
-
-
-def _printable(text: str) -> str:
-    """Escape control characters so repo-supplied text can't rewrite the terminal."""
-    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
 
 
 _LFS_POINTER = b"version https://git-lfs.github.com/spec/"
@@ -11842,15 +11829,15 @@ def _bundle_untrusted_dir(source: Path) -> bytes:
             if ".git" in rel.parts:
                 continue
             if file_path.is_symlink():
-                raise _agent_cli_error(
-                    f"{_printable(str(rel))} is a symlink; refusing to install "
+                raise cli_error_without_recovery_hint(
+                    f"{printable(str(rel))} is a symlink; refusing to install "
                     "an agent with symlinks from a remote repo."
                 )
             if file_path.is_file():
                 with file_path.open("rb") as fh:
                     if fh.read(len(_LFS_POINTER)) == _LFS_POINTER:
-                        raise _agent_cli_error(
-                            f"{_printable(str(rel))} is stored in Git LFS, which "
+                        raise cli_error_without_recovery_hint(
+                            f"{printable(str(rel))} is stored in Git LFS, which "
                             "`omnigent agent add` doesn't download."
                         )
                 tf.add(str(file_path), arcname=str(rel))
@@ -11874,16 +11861,20 @@ def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
             timeout=300,
         )
     except FileNotFoundError:
-        raise _agent_cli_error("Installing from GitHub needs git on your PATH.") from None
+        raise cli_error_without_recovery_hint(
+            "Installing from GitHub needs git on your PATH."
+        ) from None
     except subprocess.TimeoutExpired:
-        raise _agent_cli_error(f"Timed out cloning {clone_url}.") from None
+        raise cli_error_without_recovery_hint(f"Timed out cloning {clone_url}.") from None
     if proc.returncode != 0:
         hint = (
             "\n(Only branch and tag names work as a ref, not commit SHAs.)"
             if ref and re.fullmatch(r"[0-9a-f]{7,40}", ref)
             else ""
         )
-        raise _agent_cli_error(f"Could not clone {clone_url}: {proc.stderr.strip()}{hint}")
+        raise cli_error_without_recovery_hint(
+            f"Could not clone {clone_url}: {proc.stderr.strip()}{hint}"
+        )
 
 
 def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[explicit-any]  # httpx.Client
@@ -11893,7 +11884,7 @@ def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[exp
     )
     _raise_for_agent_api(resp)
     agent = resp.json()
-    name = _printable(str(agent["name"]))
+    name = printable(str(agent["name"]))
     click.echo(f"Installed {name} (version {agent['version']}, id {agent['id']})")
     if agent["version"] > 1:
         # Terminal (TUI) harnesses keep the agent they launched with.
@@ -11961,12 +11952,18 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
             for p in (root, *root.parents)
             if p != checkout and p.is_relative_to(checkout)
         ):
-            raise _agent_cli_error(f"{subpath!r} goes through a symlink in {clone_url}.")
+            raise cli_error_without_recovery_hint(
+                f"{subpath!r} goes through a symlink in {clone_url}."
+            )
         if not root.is_dir():
-            raise _agent_cli_error(f"{subpath!r} is not a directory in {clone_url}.")
+            raise cli_error_without_recovery_hint(
+                f"{subpath!r} is not a directory in {clone_url}."
+            )
         agents = [(_agent_dir_name(d), d) for d in _find_agent_dirs(root)]
         if not agents:
-            raise _agent_cli_error(f"No agent (a directory with config.yaml) in {source}.")
+            raise cli_error_without_recovery_hint(
+                f"No agent (a directory with config.yaml) in {source}."
+            )
         by_name: dict[str, list[Path]] = {}
         for n, d in agents:
             by_name.setdefault(n.lower(), []).append(d)
@@ -11975,16 +11972,20 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
             where = "; ".join(
                 ", ".join(d.relative_to(checkout).as_posix() for d in ds) for ds in dupes
             )
-            raise _agent_cli_error(f"Agents in {source} share a name: {_printable(where)}.")
+            raise cli_error_without_recovery_hint(
+                f"Agents in {source} share a name: {printable(where)}."
+            )
         if wanted:
             match = [(n, d) for n, d in agents if n.lower() == wanted.lower()]
             if not match:
-                found = _printable(", ".join(n for n, _ in agents))
-                raise _agent_cli_error(f"No agent named {wanted!r} in {source}; found: {found}.")
+                found = printable(", ".join(n for n, _ in agents))
+                raise cli_error_without_recovery_hint(
+                    f"No agent named {wanted!r} in {source}; found: {found}."
+                )
             agents = match
         click.echo(f"Found {len(agents)} agent(s) in {source}:")
         for n, d in agents:
-            click.echo(f"  {_printable(n)}  ({_printable(d.relative_to(checkout).as_posix())})")
+            click.echo(f"  {printable(n)}  ({printable(d.relative_to(checkout).as_posix())})")
         if list_only:
             return
         if not yes:
@@ -11997,10 +11998,12 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
                 try:
                     _upload_agent(client, bundle_bytes)
                 except click.ClickException as exc:
-                    click.echo(f"Skipped {_printable(n)}: {_printable(exc.message)}", err=True)
+                    click.echo(f"Skipped {printable(n)}: {printable(exc.message)}", err=True)
                     failed.append(n)
         if failed:
-            raise _agent_cli_error(f"{len(failed)} of {len(bundles)} agent(s) not installed.")
+            raise cli_error_without_recovery_hint(
+                f"{len(failed)} of {len(bundles)} agent(s) not installed."
+            )
 
 
 def _list_agents(client: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]  # httpx.Client + JSON rows
@@ -12055,10 +12058,10 @@ def agent_remove(agent: str, yes: bool, server: str | None) -> None:
         rows = _list_agents(client)
         matches = [a for a in rows if a["id"] == agent] or [a for a in rows if a["name"] == agent]
         if not matches:
-            raise _agent_cli_error(f"You have no agent named {agent!r}.")
+            raise cli_error_without_recovery_hint(f"You have no agent named {agent!r}.")
         if len(matches) > 1:
             ids = ", ".join(a["id"] for a in matches)
-            raise _agent_cli_error(
+            raise cli_error_without_recovery_hint(
                 f"You have {len(matches)} agents named {agent!r}; remove one by id: {ids}"
             )
         name = matches[0]["name"]

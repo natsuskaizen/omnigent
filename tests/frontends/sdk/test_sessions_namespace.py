@@ -1530,8 +1530,8 @@ async def _launch_hosts(
     *,
     status_code: int = 200,
     **kwargs: Any,
-) -> list[tuple[str, str]]:
-    """Run ``list_launch_hosts`` against a mocked ``GET /v1/hosts``; return (id, name) pairs."""
+) -> list[tuple[str, str, bool, str | None]]:
+    """Run ``list_launch_hosts`` on a mocked listing; return (id, name, launchable, reason)."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/hosts"
@@ -1542,38 +1542,40 @@ async def _launch_hosts(
         hosts = await ns.list_launch_hosts(**kwargs)
     finally:
         await client.aclose()
-    return [(h.host_id, h.name) for h in hosts]
+    return [(h.host_id, h.name, h.launchable, h.unavailable_reason) for h in hosts]
 
 
 @pytest.mark.asyncio
-async def test_list_launch_hosts_skips_hosts_that_cannot_launch() -> None:
+async def test_list_launch_hosts_flags_hosts_that_cannot_launch() -> None:
+    """Readiness follows the server's launch check; auth is advisory."""
     hosts = [
         _host("offline", status="offline", harnesses={"claude-sdk": True}),
         _host("sandbox", sandbox_provider="modal", harnesses={"claude-sdk": True}),
         _host("missing", harnesses={"claude-sdk": "binary-missing"}),
+        _host("old", harnesses={"claude-sdk": "version-too-low"}),
         _host("disabled", harnesses={"claude-sdk": False}),
+        _host("absent", harnesses={"codex": True}),
         _host("needs_auth", harnesses={"claude-sdk": "needs-auth"}),
+        _host("ready", harnesses={"claude-sdk": True}),
+        _host("unknown", harnesses=None),
     ]
 
-    assert await _launch_hosts({"hosts": hosts}, harness="claude-sdk") == [
-        ("needs_auth", "needs_auth.local")
-    ]
+    listed = await _launch_hosts({"hosts": hosts}, harness="claude-sdk")
 
-
-@pytest.mark.asyncio
-async def test_list_launch_hosts_accepts_unknown_readiness() -> None:
-    """A host that hasn't reported readiness for the harness may still launch it."""
-    hosts = [_host("h1", harnesses=None), _host("h2", harnesses={"codex": False})]
-
-    assert [h for h, _ in await _launch_hosts({"hosts": hosts}, harness="claude-sdk")] == [
-        "h1",
-        "h2",
+    assert [(h, ok, why) for h, _, ok, why in listed] == [
+        ("missing", False, "binary-missing"),
+        ("old", False, "version-too-low"),
+        ("disabled", False, "unconfigured"),
+        ("absent", False, "unconfigured"),
+        ("needs_auth", True, None),
+        ("ready", True, None),
+        ("unknown", True, None),
     ]
 
 
 @pytest.mark.asyncio
 async def test_list_launch_hosts_matches_canonical_harness_name() -> None:
-    hosts = [_host("h1", harnesses={"claude-sdk": False}), _host("h2", harnesses={"claude": True})]
+    hosts = [_host("h1", harnesses={"claude": True})]
 
     listed = await _launch_hosts(
         {"hosts": hosts},
@@ -1581,8 +1583,14 @@ async def test_list_launch_hosts_matches_canonical_harness_name() -> None:
         canonicalize=lambda name: "claude-sdk" if name == "claude" else name,
     )
 
-    # h1 marks the canonical name unavailable; h2 is ready under its alias.
-    assert [h for h, _ in listed] == ["h2"]
+    assert [(h, ok) for h, _, ok, _ in listed] == [("h1", True)]
+
+
+@pytest.mark.asyncio
+async def test_list_launch_hosts_without_harness_marks_every_host_launchable() -> None:
+    hosts = [_host("h1", harnesses={"claude-sdk": False})]
+
+    assert [ok for _, _, ok, _ in await _launch_hosts({"hosts": hosts})] == [True]
 
 
 @pytest.mark.asyncio
@@ -1595,7 +1603,10 @@ async def test_list_launch_hosts_skips_malformed_rows_and_names_by_id() -> None:
         _host("ok"),
     ]
 
-    assert await _launch_hosts({"hosts": hosts}) == [("unnamed", "unnamed"), ("ok", "ok.local")]
+    assert [(h, n) for h, n, _, _ in await _launch_hosts({"hosts": hosts})] == [
+        ("unnamed", "unnamed"),
+        ("ok", "ok.local"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1612,3 +1623,67 @@ async def test_list_launch_hosts_on_server_without_hosts_route_is_empty() -> Non
 async def test_list_launch_hosts_server_error_raises() -> None:
     with pytest.raises(OmnigentError):
         await _launch_hosts({}, status_code=500)
+
+
+# ── resolve_agent() user-agent fallback ───────────────────────────────
+
+
+def _agents_handler(
+    server: list[str], user: list[str] | None, *, user_status: int = 200
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/agents"
+        if request.url.params.get("scope") == "user":
+            if user is None:
+                return httpx.Response(user_status, json={"detail": "nope"})
+            rows = [{"id": f"uid_{n}", "name": n, "harness": "codex"} for n in user]
+        else:
+            rows = [{"id": f"id_{n}", "name": n, "harness": "claude-sdk"} for n in server]
+        return httpx.Response(200, json={"data": rows, "has_more": False})
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_falls_back_to_the_callers_user_agents() -> None:
+    ns, client = _make_namespace(_agents_handler(["scribe"], ["mine"]))
+    try:
+        agent = await ns.resolve_agent("mine")
+    finally:
+        await client.aclose()
+
+    assert (agent.id, agent.harness) == ("uid_mine", "codex")
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_prefers_server_agents_over_user_agents() -> None:
+    ns, client = _make_namespace(_agents_handler(["scribe"], ["scribe"]))
+    try:
+        agent = await ns.resolve_agent("scribe")
+    finally:
+        await client.aclose()
+
+    assert agent.id == "id_scribe"
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_miss_lists_both_kinds_of_agent() -> None:
+    ns, client = _make_namespace(_agents_handler(["scribe"], ["mine"]))
+    try:
+        with pytest.raises(LookupError) as excinfo:
+            await ns.resolve_agent("ghost")
+    finally:
+        await client.aclose()
+
+    assert "scribe" in str(excinfo.value) and "mine" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 422])
+async def test_resolve_agent_on_server_without_user_scope_is_a_plain_miss(status: int) -> None:
+    ns, client = _make_namespace(_agents_handler(["scribe"], None, user_status=status))
+    try:
+        with pytest.raises(LookupError, match="scribe"):
+            await ns.resolve_agent("ghost")
+    finally:
+        await client.aclose()

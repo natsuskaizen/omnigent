@@ -1770,8 +1770,7 @@ class _SessionsChatReplAdapter:
         launch_host_id: str | None = None
         if self._runner_id is None:
             from omnigent.remote_launch import (
-                RemoteLaunchHostError,
-                remote_launch_host_message,
+                LaunchHostError,
                 resolve_remote_launch_host,
             )
 
@@ -1782,8 +1781,8 @@ class _SessionsChatReplAdapter:
                     self._client.sessions,
                     harness=agent.harness if agent is not None else None,
                 )
-            except RemoteLaunchHostError as exc:
-                raise RuntimeError(remote_launch_host_message(exc)) from exc
+            except LaunchHostError as exc:
+                raise RuntimeError(str(exc)) from exc
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override

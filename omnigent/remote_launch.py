@@ -4,22 +4,52 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
 
 if TYPE_CHECKING:
     from omnigent_client import SessionsNamespace
 
 
-class RemoteLaunchHostError(RuntimeError):
+class LaunchHostError(RuntimeError):
+    """No runner is online and no connected host can launch one here; ``str()`` says why."""
+
+
+class RemoteLaunchHostError(LaunchHostError):
     """
-    Only hosts on other machines are connected, so none can use this cwd.
+    Only hosts on other machines can launch the runner, and none can use this cwd.
 
     :param host_names: Display names of those hosts, e.g. ``["devbox.local"]``.
     """
 
     def __init__(self, host_names: list[str]) -> None:
-        super().__init__(f"Connected hosts are on other machines: {', '.join(host_names)}")
+        names = ", ".join(printable(name) for name in host_names)
+        super().__init__(
+            f"No runner is online, and the connected hosts ({names}) are other machines "
+            "that can't use this directory as their workspace. Run this command on one of "
+            f"them, or connect this machine with `{cli_invocation()} host --server <url>`."
+        )
         self.host_names = host_names
+
+
+class LocalHostCannotLaunchError(LaunchHostError):
+    """
+    This machine is a connected host but reports it can't run the agent's harness.
+
+    :param harness: The agent's harness, e.g. ``"claude-sdk"``.
+    :param reason: The host's readiness report, e.g. ``"binary-missing"``.
+    """
+
+    def __init__(self, harness: str | None, reason: str | None) -> None:
+        from omnigent.onboarding.harness_install import harness_setup_hint
+
+        super().__init__(
+            f"No runner is online, and this machine's host can't run "
+            f"{printable(harness or 'this agent')} ({printable(reason or 'unavailable')}): "
+            f"{harness_setup_hint(harness)}, then restart `{cli_invocation()} host`."
+        )
+        self.harness = harness
+        self.reason = reason
 
 
 async def resolve_remote_launch_host(
@@ -33,9 +63,11 @@ async def resolve_remote_launch_host(
 
     :param sessions: The client's sessions namespace.
     :param harness: Harness the agent runs on, e.g. ``"claude-sdk"``.
-    :returns: This machine's host id, or ``None`` when no host is connected.
-    :raises RemoteLaunchHostError: If hosts are connected but none is this
-        machine.
+    :returns: This machine's host id, or ``None`` when no connected host
+        could run the agent.
+    :raises LocalHostCannotLaunchError: If this machine is a connected host
+        that can't run *harness*.
+    :raises RemoteLaunchHostError: If only other machines' hosts could.
     """
     from omnigent.harness_aliases import canonicalize_harness
     from omnigent.host import identity
@@ -44,24 +76,13 @@ async def resolve_remote_launch_host(
         harness=harness,
         canonicalize=lambda name: canonicalize_harness(name) or name,
     )
-    if not hosts:
-        return None
     local = identity.load_host_identity_if_present()
-    if local is not None and any(host.host_id == local.host_id for host in hosts):
-        return local.host_id
-    raise RemoteLaunchHostError([host.name for host in hosts])
-
-
-def remote_launch_host_message(exc: RemoteLaunchHostError) -> str:
-    """
-    Explain why a host on another machine wasn't used, and what to do.
-
-    :param exc: The error naming the connected hosts.
-    :returns: A one-line, actionable error message.
-    """
-    return (
-        f"No runner is online, and the connected hosts ({', '.join(exc.host_names)}) are "
-        "other machines that can't use this directory as their workspace. Run this "
-        f"command on one of them, or connect this machine with `{cli_invocation()} host "
-        "--server <url>`."
-    )
+    mine = next((h for h in hosts if local is not None and h.host_id == local.host_id), None)
+    if mine is not None:
+        if mine.launchable:
+            return mine.host_id
+        raise LocalHostCannotLaunchError(harness, mine.unavailable_reason)
+    others = [h.name for h in hosts if h.launchable]
+    if others:
+        raise RemoteLaunchHostError(others)
+    return None

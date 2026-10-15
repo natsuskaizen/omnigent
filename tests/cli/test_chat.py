@@ -4701,17 +4701,29 @@ def _fake_listings(
     *,
     session_agents: list[str],
     agent_pages: list[list[str]],
+    user_agents: list[str] | None = None,
 ) -> list[dict[str, object]]:
-    """Serve ``GET /v1/sessions`` and a paged ``GET /v1/agents``; return agent-page params."""
+    """Serve sessions, paged server agents and user agents; return server-page params."""
     agent_calls: list[dict[str, object]] = []
 
     def _get(url: str, **kwargs: object) -> _ListingResp:
         if url.endswith("/v1/sessions"):
             return _ListingResp({"data": [{"agent_name": n} for n in session_agents]})
+        params = kwargs.get("params")
+        if (
+            url.endswith("/v1/agents")
+            and isinstance(params, dict)
+            and params.get("scope") == "user"
+        ):
+            names = user_agents or []
+            return _ListingResp(
+                {"data": [{"id": f"uid_{n}", "name": n} for n in names], "has_more": False}
+            )
         if url.endswith("/v1/agents"):
-            params = kwargs.get("params")
             agent_calls.append(dict(params) if isinstance(params, dict) else {})
-            page = len(agent_calls) - 1
+            after = params.get("after") if isinstance(params, dict) else None
+            cursors = [f"id_{names[-1]}" if names else None for names in agent_pages]
+            page = cursors.index(after) + 1 if after is not None and after in cursors else 0
             names = agent_pages[page]
             has_more = page + 1 < len(agent_pages)
             return _ListingResp(
@@ -4915,6 +4927,10 @@ def _host_launch_client(
         created.update(kwargs, agent_id=agent_id)
         raise _StopAfterCreate
 
+    async def _get(session_id: str) -> SimpleNamespace:
+        calls.append("get")
+        return SimpleNamespace(id=session_id, harness="claude-sdk")
+
     async def _bind_runner(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("a host-launched session is bound by the server")
 
@@ -4925,6 +4941,7 @@ def _host_launch_client(
             list_launch_hosts=_list_launch_hosts,
             create_from_agent_id=_create,
             bind_runner=_bind_runner,
+            get=_get,
         )
     )
 
@@ -5136,4 +5153,151 @@ def test_list_server_agent_names_stops_when_cursor_does_not_advance(
     monkeypatch.setattr(chat_module.httpx, "get", _get)
 
     assert chat_module._list_server_agent_names("http://127.0.0.1:6799") == ["a"]
-    assert len(calls) == 2
+    server_calls = [c for c in calls if isinstance(c, dict) and "scope" not in c]
+    assert len(server_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# User agents, display URLs, response shapes and terminal-safe names
+# ---------------------------------------------------------------------------
+
+
+def test_list_server_agent_names_includes_the_callers_user_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent agent add`` installs a user agent; ``run --server`` must see it."""
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[["scribe"]], user_agents=["mine"])
+
+    assert chat_module._list_server_agent_names("http://127.0.0.1:6799") == ["scribe", "mine"]
+
+
+def test_require_server_agent_accepts_a_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[["scribe"]], user_agents=["mine"])
+
+    chat_module._require_server_agent("http://127.0.0.1:6799", "mine")
+
+
+def test_list_server_agent_names_tolerates_server_without_user_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older server that rejects ``scope=user`` still lists its server agents."""
+
+    def _get(_url: str, **kwargs: object) -> _ListingResp:
+        params = kwargs.get("params")
+        if isinstance(params, dict) and params.get("scope") == "user":
+            return _ListingResp({}, status_code=422)
+        return _ListingResp({"data": [{"name": "scribe"}], "has_more": False})
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    assert chat_module._list_server_agent_names("http://127.0.0.1:6799") == ["scribe"]
+
+
+@pytest.mark.parametrize("body", [["not", "a", "dict"], "<html>login</html>"])
+def test_list_server_agent_names_unexpected_body_is_a_click_error(
+    body: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A proxy page or odd body is a clean error, not an AttributeError traceback."""
+
+    class _Resp(_ListingResp):
+        def json(self) -> object:  # type: ignore[override]
+            if isinstance(body, str):
+                raise ValueError("not JSON")
+            return body
+
+    monkeypatch.setattr(chat_module.httpx, "get", lambda *_a, **_kw: _Resp({}))
+
+    with pytest.raises(click.ClickException, match="unexpected"):
+        chat_module._list_server_agent_names("http://127.0.0.1:6799")
+
+
+_WORKSPACE_API_BASE = "https://ws.example.com/api/2.0/omnigent"
+
+
+def test_agent_choice_errors_show_the_display_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Suggested commands use the URL the user typed, not the internal API mount."""
+    from omnigent.util.server_url import display_server_url
+
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[["jcode", "scribe"]])
+
+    with pytest.raises(click.ClickException) as ambiguous:
+        _pick_agent(_WORKSPACE_API_BASE, quiet=True)
+    with pytest.raises(click.ClickException) as unknown:
+        chat_module._require_server_agent(_WORKSPACE_API_BASE, "nope")
+
+    for exc in (ambiguous.value, unknown.value):
+        assert display_server_url(_WORKSPACE_API_BASE) in str(exc)
+        assert "/api/2.0/omnigent" not in str(exc)
+
+
+_EVIL = "evil\x1b[2J\x1b]0;pwned\x07"
+
+
+def test_agent_names_are_escaped_in_errors_and_the_picker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Server-supplied names can't inject terminal control sequences."""
+    _fake_listings(monkeypatch, session_agents=[], agent_pages=[[_EVIL, "scribe"]])
+
+    with pytest.raises(click.ClickException) as ambiguous:
+        _pick_agent("http://127.0.0.1:6799", quiet=True)
+    with pytest.raises(click.ClickException) as unknown:
+        chat_module._require_server_agent("http://127.0.0.1:6799", "nope\x1b[2J")
+    monkeypatch.setattr(chat_module.click, "prompt", lambda *_a, **_kw: "2")
+    _pick_agent("http://127.0.0.1:6799")
+    picker = capsys.readouterr().out
+
+    for text in (str(ambiguous.value), str(unknown.value), picker):
+        assert "\x1b" not in text
+        assert "\\x1b" in text
+
+
+class _StopAfterBind(Exception):
+    """Ends ``_query_sessions_once`` once the runner bind is observed."""
+
+
+def test_query_sessions_once_resume_uses_the_sessions_harness_not_its_agent_name() -> None:
+    """A resumed session may use an uploaded agent that isn't resolvable by name."""
+    seen: dict[str, object] = {}
+
+    async def _resolve_agent(name: str) -> object:
+        raise AssertionError(f"resume must not resolve {name!r} by name")
+
+    async def _get(session_id: str) -> SimpleNamespace:
+        return SimpleNamespace(id=session_id, harness="claude-sdk")
+
+    async def _online_runner(**kwargs: object) -> str:
+        seen["harness"] = kwargs.get("harness")
+        return "runner_1"
+
+    async def _bind_runner(session_id: str, *, runner_id: str) -> None:
+        seen["bound"] = (session_id, runner_id)
+        raise _StopAfterBind
+
+    client = SimpleNamespace(
+        sessions=SimpleNamespace(
+            resolve_agent=_resolve_agent,
+            get=_get,
+            resolve_online_runner=_online_runner,
+            bind_runner=_bind_runner,
+        )
+    )
+
+    with pytest.raises(_StopAfterBind):
+        _query_once(client, agent_name="uploaded_yaml_agent", resume_conversation_id="conv_x")
+
+    assert seen == {"harness": "claude-sdk", "bound": ("conv_x", "runner_1")}
+
+
+def test_query_sessions_once_unknown_agent_is_a_clean_cli_error() -> None:
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    async def _resolve_agent(name: str) -> object:
+        raise LookupError(f"No agent named {name!r} is registered on this server.")
+
+    client = SimpleNamespace(sessions=SimpleNamespace(resolve_agent=_resolve_agent))
+
+    with pytest.raises(click.ClickException, match="No agent named") as excinfo:
+        _query_once(client, agent_name="ghost")
+
+    assert suppresses_recovery_hint(excinfo.value)

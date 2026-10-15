@@ -327,8 +327,9 @@ class SessionListItem:
         )
 
 
-# Host readiness values meaning the harness can't run there at all.
-_UNLAUNCHABLE_READINESS: frozenset[object] = frozenset({False, "binary-missing"})
+# Host readiness a launch can proceed with; auth is advisory since a session
+# can supply its own credentials.
+_LAUNCHABLE_READINESS: frozenset[object] = frozenset({True, "needs-auth"})
 
 
 @dataclass(frozen=True)
@@ -340,10 +341,16 @@ class LaunchHost:
         ``"a1b2c3d4e5f67890abcdef1234567890"``.
     :param name: Display name, e.g. ``"laptop.local"``; the id when the
         host reported none.
+    :param launchable: Whether the host reports it can run the requested
+        harness (or hasn't reported readiness at all).
+    :param unavailable_reason: Why it can't, e.g. ``"binary-missing"`` or
+        ``"unconfigured"``; ``None`` when launchable.
     """
 
     host_id: str
     name: str
+    launchable: bool = True
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -519,9 +526,10 @@ class SessionsNamespace:
 
         Used by clients that only know the name the user picked — the
         remote-URL chat picker lists names, but session creation binds
-        by id. ``GET /v1/agents`` lists only server-registered
-        (``session_id IS NULL``) agents, so a session-scoped agent is
-        not resolvable this way and raises ``LookupError``.
+        by id. Searches server agents (``GET /v1/agents``), then the
+        caller's own (``scope=user``, from ``omnigent agent add``); a
+        session-scoped agent is not resolvable this way and raises
+        ``LookupError``.
 
         Follows the listing cursor, so an agent past the first page
         still resolves. The only quiet end of the walk is the server
@@ -540,49 +548,57 @@ class SessionsNamespace:
         names: list[str] = []
         truncated = False
         after: str | None = None
-        while True:
-            params: dict[str, str | int] = {"limit": 1000}
-            if after is not None:
-                params["after"] = after
-            resp = await self._http.get(f"{self._base}/v1/agents", params=params)
-            raise_for_status(resp.status_code, response_body(resp))
-            listing = require_json_object(resp, "GET /v1/agents")
-            data = listing.get("data", [])
-            for item in data if isinstance(data, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("name")
-                if name == agent_name:
-                    harness = item.get("harness")
-                    return RegisteredAgent(
-                        id=str(item["id"]),
-                        harness=str(harness) if isinstance(harness, str) else None,
+        # Server agents first, then the caller's own (``omnigent agent add``).
+        for scope in (None, "user"):
+            after = None
+            while True:
+                params: dict[str, str | int] = {"limit": 1000}
+                if scope is not None:
+                    params["scope"] = scope
+                if after is not None:
+                    params["after"] = after
+                resp = await self._http.get(f"{self._base}/v1/agents", params=params)
+                if scope is not None and resp.status_code in (404, 422):
+                    # A server without user agents: only server agents exist.
+                    break
+                raise_for_status(resp.status_code, response_body(resp))
+                listing = require_json_object(resp, "GET /v1/agents")
+                data = listing.get("data", [])
+                for item in data if isinstance(data, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    if name == agent_name:
+                        harness = item.get("harness")
+                        return RegisteredAgent(
+                            id=str(item["id"]),
+                            harness=str(harness) if isinstance(harness, str) else None,
+                        )
+                    if isinstance(name, str):
+                        if len(names) < 50:
+                            names.append(name)
+                        else:
+                            truncated = True
+                if not listing.get("has_more"):
+                    break
+                last_id = listing.get("last_id")
+                if not last_id:
+                    # Server reports more pages but provides no cursor to advance
+                    # — raise rather than silently stopping, so callers can
+                    # distinguish a pagination stall from "agent not found".
+                    raise OmnigentError(
+                        f"agent listing stalled: server returned has_more=True but"
+                        f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
                     )
-                if isinstance(name, str):
-                    if len(names) < 50:
-                        names.append(name)
-                    else:
-                        truncated = True
-            if not listing.get("has_more"):
-                break
-            last_id = listing.get("last_id")
-            if not last_id:
-                # Server reports more pages but provides no cursor to advance
-                # — raise rather than silently stopping, so callers can
-                # distinguish a pagination stall from "agent not found".
-                raise OmnigentError(
-                    f"agent listing stalled: server returned has_more=True but"
-                    f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
-                )
-            next_after = str(last_id)
-            if next_after == after:
-                # A cursor that does not advance would page forever; raise
-                # instead of looping on the same page.
-                raise OmnigentError(
-                    f"agent listing stalled: server repeated cursor {next_after!r}"
-                    f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
-                )
-            after = next_after
+                next_after = str(last_id)
+                if next_after == after:
+                    # A cursor that does not advance would page forever; raise
+                    # instead of looping on the same page.
+                    raise OmnigentError(
+                        f"agent listing stalled: server repeated cursor {next_after!r}"
+                        f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
+                    )
+                after = next_after
         available = ", ".join(names) + (", …" if truncated else "")
         raise LookupError(
             f"No agent named {agent_name!r} is registered on this server. Available: {available}"
@@ -651,21 +667,22 @@ class SessionsNamespace:
         canonicalize: Callable[[str], str] | None = None,
     ) -> list[LaunchHost]:
         """
-        List connected hosts the server could launch a runner on for *harness*.
+        List connected hosts the server could launch a runner on, with readiness.
 
         The fallback when :meth:`resolve_online_runner` finds no runner:
-        creating the session with one of these host ids makes the server
-        launch a runner there, as the web UI's new-session flow does.
-        Candidates are online hosts that aren't server-managed sandboxes and
-        don't report *harness* as unavailable; a host that hasn't reported
-        its readiness for *harness* still counts.
+        creating the session with a launchable host's id makes the server
+        launch a runner there, as the web UI's new-session flow does. Lists
+        online hosts that aren't server-managed sandboxes, flagging whether
+        each can run *harness* the way the server's launch check does: a
+        host that hasn't reported readiness counts as launchable, while one
+        whose report omits *harness* does not.
 
         :param harness: Harness the session needs, e.g. ``"claude-sdk"``.
-            ``None`` accepts any candidate host.
+            ``None`` marks every listed host launchable.
         :param canonicalize: Optional harness-name normalizer applied to
             both sides, as in :meth:`resolve_online_runner`.
-        :returns: Candidate hosts in listing order; empty when there are
-            none or the server predates ``GET /v1/hosts``.
+        :returns: Hosts in listing order; empty when there are none or the
+            server predates ``GET /v1/hosts``.
         :raises OmnigentError: If the listing returns another non-2xx status.
         """
         resp = await self._http.get(f"{self._base}/v1/hosts")
@@ -679,7 +696,7 @@ class SessionsNamespace:
             return canonicalize(name) if canonicalize is not None else name
 
         wanted = {harness, _norm(harness)} if harness is not None else set()
-        candidates: list[LaunchHost] = []
+        result: list[LaunchHost] = []
         for item in hosts if isinstance(hosts, list) else []:
             if not isinstance(item, dict) or item.get("status") != "online":
                 continue
@@ -688,20 +705,21 @@ class SessionsNamespace:
             host_id = item.get("host_id")
             if not isinstance(host_id, str) or not host_id:
                 continue
+            name = item.get("name")
+            display = name if isinstance(name, str) and name else host_id
+            reason: str | None = None
             readiness = item.get("configured_harnesses")
-            if wanted and isinstance(readiness, dict):
+            if wanted and isinstance(readiness, dict) and readiness:
                 matches = [
                     value
-                    for name, value in readiness.items()
-                    if isinstance(name, str) and (name in wanted or _norm(name) in wanted)
+                    for key, value in readiness.items()
+                    if isinstance(key, str) and (key in wanted or _norm(key) in wanted)
                 ]
-                if matches and all(value in _UNLAUNCHABLE_READINESS for value in matches):
-                    continue
-            name = item.get("name")
-            candidates.append(
-                LaunchHost(host_id, name if isinstance(name, str) and name else host_id)
-            )
-        return candidates
+                if not any(value in _LAUNCHABLE_READINESS for value in matches):
+                    first = matches[0] if matches else None
+                    reason = first if isinstance(first, str) else "unconfigured"
+            result.append(LaunchHost(host_id, display, reason is None, reason))
+        return result
 
     async def list(
         self,

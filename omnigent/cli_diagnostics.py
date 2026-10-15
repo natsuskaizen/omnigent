@@ -411,6 +411,23 @@ def print_stale_host_hint() -> None:
 SUPPRESS_RECOVERY_HINT_ATTR = "omnigent_suppress_recovery_hint"
 
 
+def cli_error_without_recovery_hint(message: str) -> click.ClickException:
+    """
+    Build a :class:`click.ClickException` that the stale-host hint can't fix.
+
+    :param message: The user-facing error text.
+    :returns: The exception, marked with :data:`SUPPRESS_RECOVERY_HINT_ATTR`.
+    """
+    exc = click.ClickException(message)
+    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
+
+
+def printable(text: str) -> str:
+    """Escape control characters so untrusted text can't rewrite the terminal."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
 def suppresses_recovery_hint(exc: BaseException) -> bool:
     """
     Report whether the stale-host recovery hint should be withheld for *exc*.

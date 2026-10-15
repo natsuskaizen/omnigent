@@ -122,3 +122,20 @@ async def test_remote_repl_without_runner_or_host_still_fails_loudly(
     assert created.get("host_id") is None
     with pytest.raises(RuntimeError, match="no online runner"):
         await adapter._bind_runner_if_needed()
+
+
+@pytest.mark.asyncio
+async def test_remote_repl_with_this_host_unable_to_run_the_harness_says_why(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _local_host(monkeypatch, "host_local")
+    created: dict[str, Any] = {}
+    host = LaunchHost(
+        "host_local", "me.local", launchable=False, unavailable_reason="binary-missing"
+    )
+    adapter = _adapter(_sessions_stub(hosts=[host], created=created, bound=[]))
+
+    with pytest.raises(RuntimeError, match="binary-missing"):
+        await adapter._create_session_from_registered_agent(pending_debug=False)
+
+    assert "agent_id" not in created
